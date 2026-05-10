@@ -1,6 +1,6 @@
 {  
   "name": "mega-agency-bot",  
-  "version": "2.0.1",  
+  "version": "2.1.0",  
   "description": "Mega Agency WhatsApp AI Sales Bot with Upstash",  
   "main": "index.js",  
   "scripts": {  
