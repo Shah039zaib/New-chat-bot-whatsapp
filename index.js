@@ -1,9 +1,9 @@
 require('dotenv').config();  
   
+const fs = require('fs');  
 const path = require('path');  
 const zlib = require('zlib');  
 const crypto = require('crypto');  
-const fs = require('fs');  
 const http = require('http');  
 const url = require('url');  
   
@@ -17,18 +17,93 @@ const {
   useMultiFileAuthState,  
   Browsers,  
   fetchLatestBaileysVersion,  
-  downloadMediaMessage,  
-  makeInMemoryStore  
+  downloadMediaMessage  
 } = require('@whiskeysockets/baileys');  
   
-require('dotenv').config();  
+// Global safety logs for Render  
+process.on('unhandledRejection', (reason) => console.error('❗ unhandledRejection:', reason));  
+process.on('uncaughtException', (err) => console.error('❗ uncaughtException:', err));  
   
-// ─────────────────────────────────────────// UPSTASH REDIS// ─────────────────────────────────────────  
+/* ─────────────────────────────  
+   ENV / CONFIG  
+───────────────────────────── */  
+const PORT = process.env.PORT || 3000;  
+  
 const REDIS_URL = process.env.UPSTASH_REDIS_REST_URL;  
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;  
-  
 const upstashEnabled = !!(REDIS_URL && REDIS_TOKEN);  
   
+const BOT_DATA_KEY = process.env.UPSTASH_BOT_DATA_KEY || 'bot_data_v7';  
+const BOT_DATA_FILE = process.env.BOT_DATA_FILE || '/tmp/bot_data_v7.json';  
+  
+const WA_AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || '/tmp/auth_info';  
+const WA_AUTH_PREFIX = process.env.WHATSAPP_UPSTASH_AUTH_PREFIX || 'mega-agency-bot:wa-auth:v1';  
+const WA_AUTH_CREDS_KEY = `${WA_AUTH_PREFIX}:creds`;  
+const WA_AUTH_SNAPSHOT_KEY = `${WA_AUTH_PREFIX}:snapshot`;  
+  
+const WHATSAPP_UPSTASH_SAVE_SNAPSHOT =  
+  (process.env.WHATSAPP_UPSTASH_SAVE_SNAPSHOT || 'true').toLowerCase() === 'true';  
+  
+const WHATSAPP_UPSTASH_SNAPSHOT_MAX_BYTES = parseInt(  
+  process.env.WHATSAPP_UPSTASH_SNAPSHOT_MAX_BYTES || '900000',  
+  10  
+);  
+  
+const WHATSAPP_UPSTASH_SNAPSHOT_INTERVAL_MS = parseInt(  
+  process.env.WHATSAPP_UPSTASH_SNAPSHOT_INTERVAL_MS || '60000',  
+  10  
+);  
+  
+const WHATSAPP_UPSTASH_CLEAR_ON_LOGGED_OUT =  
+  (process.env.WHATSAPP_UPSTASH_CLEAR_ON_LOGGED_OUT || 'true').toLowerCase() === 'true';  
+  
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '';  
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || '';  
+const MAX_AI_CONCURRENCY = parseInt(process.env.MAX_AI_CONCURRENCY || '3', 10);  
+  
+const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';  
+const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');  
+const GOOGLE_SHEET_ID = process.env.GOOGLE_SHEET_ID || '';  
+  
+/* ─────────────────────────────  
+   SIMPLE SEMAPHORE FOR AI  
+───────────────────────────── */  
+class Semaphore {  
+  constructor(max) {  
+    this.max = max;  
+    this.current = 0;  
+    this.queue = [];  
+  }  
+  async acquire() {  
+    if (this.current < this.max) {  
+      this.current++;  
+      return;  
+    }  
+    return new Promise((resolve) => this.queue.push(resolve));  
+  }  
+  release() {  
+    this.current--;  
+    if (this.queue.length) {  
+      this.current++;  
+      const next = this.queue.shift();  
+      next();  
+    }  
+  }  
+}  
+  
+const aiSemaphore = new Semaphore(Math.max(1, MAX_AI_CONCURRENCY));  
+async function withAiLock(fn) {  
+  await aiSemaphore.acquire();  
+  try {  
+    return await fn();  
+  } finally {  
+    aiSemaphore.release();  
+  }  
+}  
+  
+/* ─────────────────────────────  
+   UPSTASH REDIS REST  
+───────────────────────────── */  
 async function redisGet(key) {  
   try {  
     const r = await axios.get(`${REDIS_URL}/get/${encodeURIComponent(key)}`, {  
@@ -67,12 +142,7 @@ async function redisDel(key) {
     await axios.post(  
       `${REDIS_URL}/del/${encodeURIComponent(key)}`,  
       {},  
-      {  
-        headers: {  
-          Authorization: `Bearer ${REDIS_TOKEN}`  
-        },  
-        timeout: 8000  
-      }  
+      { headers: { Authorization: `Bearer ${REDIS_TOKEN}` }, timeout: 8000 }  
     );  
     return true;  
   } catch {  
@@ -80,319 +150,9 @@ async function redisDel(key) {
   }  
 }  
   
-// ─────────────────────────────────────────// WHATSAPP AUTH PERSISTENCE (Upstash) // ─────────────────────────────────────────  
-const WA_AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || '/tmp/auth_info';  
-  
-// Use prefix so multiple bots don't collide  
-const WA_AUTH_PREFIX =  
-  process.env.WHATSAPP_UPSTASH_AUTH_PREFIX || 'mega-agency-bot:wa-auth:v2';  
-  
-const WA_AUTH_CREDS_KEY = `${WA_AUTH_PREFIX}:creds`;  
-const WA_AUTH_SNAPSHOT_KEY = `${WA_AUTH_PREFIX}:snapshot`;  
-  
-// Snapshot can be large; by default save only creds (enough to prevent re-login in most hosts).  
-const WA_AUTH_SAVE_SNAPSHOT =  
-  (process.env.WHATSAPP_UPSTASH_SAVE_SNAPSHOT || 'false').toLowerCase() === 'true';  
-  
-const WA_AUTH_SNAPSHOT_MAX_BYTES = parseInt(  
-  process.env.WHATSAPP_UPSTASH_SNAPSHOT_MAX_BYTES || '2500000',  
-  10  
-);  
-  
-const WA_AUTH_PERSIST_THROTTLE_MS = parseInt(  
-  process.env.WHATSAPP_UPSTASH_PERSIST_THROTTLE_MS || '8000',  
-  10  
-);  
-  
-let lastAuthPersistAt = 0;  
-let authPersistInFlight = false;  
-let authPersistPending = false;  
-  
-function ensureDirSync(dir) {  
-  fs.mkdirSync(dir, { recursive: true });  
-}  
-  
-async function restoreWhatsAppAuthFromUpstash() {  
-  if (!upstashEnabled) return;  
-  
-  ensureDirSync(WA_AUTH_DIR);  
-  
-  const credsPath = path.join(WA_AUTH_DIR, 'creds.json');  
-  const localCredsExists = fs.existsSync(credsPath);  
-  
-  const forceRestore =  
-    (process.env.WHATSAPP_AUTH_FORCE_RESTORE || 'false').toLowerCase() === 'true';  
-  
-  if (localCredsExists && !forceRestore) return;  
-  
-  // Try snapshot first (if enabled previously)  
-  try {  
-    const snap = await redisGet(WA_AUTH_SNAPSHOT_KEY);  
-    if (snap?.data) {  
-      const gz = Buffer.from(snap.data, 'base64');  
-      const jsonBuf = zlib.gunzipSync(gz);  
-      const parsed = JSON.parse(jsonBuf.toString('utf8'));  
-  
-      if (parsed?.files && typeof parsed.files === 'object') {  
-        fs.rmSync(WA_AUTH_DIR, { recursive: true, force: true });  
-        fs.mkdirSync(WA_AUTH_DIR, { recursive: true });  
-  
-        for (const [relPath, contentB64] of Object.entries(parsed.files)) {  
-          const fullPath = path.join(WA_AUTH_DIR, relPath);  
-          ensureDirSync(path.dirname(fullPath));  
-          fs.writeFileSync(fullPath, Buffer.from(contentB64, 'base64'));  
-        }  
-        console.log('✅ WhatsApp auth restored from Upstash snapshot!');  
-        return;  
-      }  
-    }  
-  } catch (e) {  
-    console.log('Auth snapshot restore failed:', e.message);  
-  }  
-  
-  // Restore creds.json only  
-  try {  
-    const creds = await redisGet(WA_AUTH_CREDS_KEY);  
-    if (creds) {  
-      fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2));  
-      console.log('✅ WhatsApp creds restored from Upstash!');  
-    }  
-  } catch {  
-    // ignore  
-  }  
-}  
-  
-function collectAuthDirFilesSnapshot(authDir) {  
-  const files = {};  
-  const stack = [authDir];  
-  
-  while (stack.length) {  
-    const current = stack.pop();  
-    const entries = fs.readdirSync(current, { withFileTypes: true });  
-  
-    for (const ent of entries) {  
-      const full = path.join(current, ent.name);  
-      if (ent.isDirectory()) {  
-        stack.push(full);  
-        continue;  
-      }  
-      if (!ent.isFile()) continue;  
-  
-      const rel = path.relative(authDir, full).replace(/\\/g, '/');  
-      const buf = fs.readFileSync(full);  
-      files[rel] = buf.toString('base64');  
-    }  
-  }  
-  
-  return { files };  
-}  
-  
-async function persistWhatsAppAuthToUpstashThrottled(force = false) {  
-  if (!upstashEnabled) return;  
-  
-  if (authPersistInFlight) {  
-    if (force) authPersistPending = true;  
-    return;  
-  }  
-  
-  const now = Date.now();  
-  if (!force && now - lastAuthPersistAt < WA_AUTH_PERSIST_THROTTLE_MS) return;  
-  
-  authPersistInFlight = true;  
-  authPersistPending = false;  
-  
-  try {  
-    const credsPath = path.join(WA_AUTH_DIR, 'creds.json');  
-    if (!fs.existsSync(credsPath)) return;  
-  
-    // Always persist creds  
-    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));  
-    await redisSet(WA_AUTH_CREDS_KEY, creds);  
-  
-    // Optional: persist full snapshot  
-    if (WA_AUTH_SAVE_SNAPSHOT) {  
-      try {  
-        const snapshot = collectAuthDirFilesSnapshot(WA_AUTH_DIR);  
-        const snapshotObj = { v: 1, files: snapshot.files };  
-        const jsonStr = JSON.stringify(snapshotObj);  
-  
-        const gz = zlib.gzipSync(Buffer.from(jsonStr, 'utf8'), { level: 9 });  
-  
-        if (gz.length <= WA_AUTH_SNAPSHOT_MAX_BYTES) {  
-          await redisSet(WA_AUTH_SNAPSHOT_KEY, {  
-            v: 1,  
-            data: gz.toString('base64'),  
-            t: Date.now()  
-          });  
-        } else {  
-          // Too large - skip snapshot to avoid errors.  
-          // Keep creds.json, which is usually enough to prevent re-login.  
-        }  
-      } catch (e) {  
-        console.log('Auth snapshot persist err:', e.message);  
-      }  
-    }  
-  
-    lastAuthPersistAt = Date.now();  
-  } catch (e) {  
-    // avoid crashing bot  
-    console.log('Auth persist err:', e.message);  
-  } finally {  
-    authPersistInFlight = false;  
-    if (authPersistPending) {  
-      authPersistPending = false;  
-      persistWhatsAppAuthToUpstashThrottled(true).catch(() => {});  
-    }  
-  }  
-}  
-  
-async function clearWhatsAppAuthInUpstash() {  
-  if (!upstashEnabled) return;  
-  await redisDel(WA_AUTH_CREDS_KEY);  
-  await redisDel(WA_AUTH_SNAPSHOT_KEY);  
-}  
-  
-// ─────────────────────────────────────────// GOOGLE SHEETS// ─────────────────────────────────────────  
-async function getGoogleToken() {  
-  try {  
-    const email = process.env.GOOGLE_CLIENT_EMAIL;  
-    const key = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');  
-    const sheetId = process.env.GOOGLE_SHEET_ID;  
-    if (!email || !key || !sheetId) return null;  
-  
-    const now = Math.floor(Date.now() / 1000);  
-  
-    // JWT header/payload  
-    const header = Buffer.from(  
-      JSON.stringify({ alg: 'RS256', typ: 'JWT' })  
-    ).toString('base64url');  
-  
-    const payload = Buffer.from(  
-      JSON.stringify({  
-        iss: email,  
-        scope: 'https://www.googleapis.com/auth/spreadsheets',  
-        aud: 'https://oauth2.googleapis.com/token',  
-        exp: now + 3600,  
-        iat: now  
-      })  
-    ).toString('base64url');  
-  
-    const sign = crypto.createSign('RSA-SHA256');  
-    sign.update(`${header}.${payload}`);  
-    const jwt = `${header}.${payload}.${sign.sign(key, 'base64url')}`;  
-  
-    const res = await axios.post(  
-      'https://oauth2.googleapis.com/token',  
-      {  
-        grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',  
-        assertion: jwt  
-      }  
-    );  
-  
-    return res.data?.access_token || null;  
-  } catch {  
-    return null;  
-  }  
-}  
-  
-async function saveToSheet(data) {  
-  try {  
-    const token = await getGoogleToken();  
-    if (!token) return;  
-  
-    const sheetId = process.env.GOOGLE_SHEET_ID;  
-  
-    await axios.post(  
-      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Sheet1!A:H:append?valueInputOption=USER_ENTERED`,  
-      {  
-        values: [  
-          [  
-            data.orderId || '',  
-            data.customerName || '',  
-            data.customerNumber || '',  
-            data.product || '',  
-            data.amount || '',  
-            data.status || '',  
-            data.language || '',  
-            new Date().toLocaleString('en-PK', {  
-              timeZone: 'Asia/Karachi'  
-            })  
-          ]  
-        ]  
-      },  
-      { headers: { Authorization: `Bearer ${token}` } }  
-    );  
-  } catch (e) {  
-    console.log('Sheet error:', e.message);  
-  }  
-}  
-  
-async function initSheet() {  
-  try {  
-    const token = await getGoogleToken();  
-    if (!token) return;  
-  
-    const sheetId = process.env.GOOGLE_SHEET_ID;  
-  
-    await axios.post(  
-      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Sheet1!A1:append?valueInputOption=USER_ENTERED`,  
-      {  
-        values: [  
-          [  
-            'Order ID',  
-            'Customer',  
-            'Phone',  
-            'Product',  
-            'Amount',  
-            'Status',  
-            'Language',  
-            'Date'  
-          ]  
-        ]  
-      },  
-      { headers: { Authorization: `Bearer ${token}` } }  
-    );  
-  } catch {  
-    // ignore  
-  }  
-}  
-  
-// ─────────────────────────────────────────// VOICE TO TEXT (Groq Whisper) // ─────────────────────────────────────────  
-async function voiceToText(audioBuffer) {  
-  try {  
-    const FormData = require('form-data');  
-    const form = new FormData();  
-    form.append('file', audioBuffer, { filename: 'audio.ogg', contentType: 'audio/ogg' });  
-    form.append('model', 'whisper-large-v3');  
-    form.append('response_format', 'json');  
-  
-    const res = await axios.post(  
-      'https://api.groq.com/openai/v1/audio/transcriptions',  
-      form,  
-      {  
-        headers: { ...form.getHeaders(), Authorization: `Bearer ${process.env.GROQ_API_KEY}` },  
-        timeout: 30000  
-      }  
-    );  
-  
-    return res.data?.text || null;  
-  } catch {  
-    return null;  
-  }  
-}  
-  
-// ─────────────────────────────────────────// LANGUAGE DETECTION // ─────────────────────────────────────────  
-function detectLang(text) {  
-  if (/[\u0600-\u06FF]/.test(text)) return 'urdu';  
-  if (/\b(kya|hai|haan|nahi|bhai|yar|chahiye|theek|acha|karo|dedo|batao|kitna|lena|mujhe|yrr)\b/i.test(text))  
-    return 'roman_urdu';  
-  return 'english';  
-}  
-  
-// ─────────────────────────────────────────// DATA STORE // ─────────────────────────────────────────  
-const DATA_KEY = 'bot_data_v6';  
-const DATA_FILE = '/tmp/bot_data_v6.json';  
-  
+/* ─────────────────────────────  
+   BOT DATA DEFAULT + LOAD/SAVE  
+───────────────────────────── */  
 function getDefaultData() {  
   return {  
     settings: {  
@@ -417,279 +177,372 @@ function getDefaultData() {
         name: '100+ Premium Shopify Themes Bundle',  
         price: 999,  
         description: 'Complete collection of 100+ premium themes for all niches',  
-        features: [  
-          '100+ Premium Themes',  
-          'All Niches Covered',  
-          'Fashion, Electronics, Food & More',  
-          'Regular Updates',  
-          '24/7 Support',  
-          'Installation Guide',  
-          'Mobile Optimized'  
-        ],  
+        features: ['100+ Premium Themes', 'All Niches Covered', 'Regular Updates', '24/7 Support'],  
         downloadLink: '',  
         active: true  
       }  
     ],  
     aiPrompt: `Tum Mega Agency ke professional AI Sales Agent ho. Tumhara naam "Max" hai.  
-TUMHARI SERVICE:-  
-Product: 100+ Premium Shopify Themes Mega Bundle  
-Price: PKR 999 ONLY (yahi final price hai — koi aur price mat batana)  
-Delivery: Payment approve hone ke 1 hour baad  
-Features: 100+ themes, fashion/electronics/food/all niches, regular updates, installation guide, 24/7 support  
   
-LANGUAGE: Customer ki language follow karo (Urdu/Roman Urdu/English)  
-TUMHARA KAAM:  
-1. Customer se warmly greet karo  
-2. Unke niche ke baare mein poocho  
-3. Value explain karo specifically  
-4. Price objections confidently handle karo  
-5. Jab customer BUY karna chahe — ORDER_READY likho  
+SERVICE:  
+- Product: 100+ Premium Shopify Themes Mega Bundle  
+- FINAL PRICE: PKR 999 ONLY (discount bilkul nahi)  
   
-PRICE NEGOTIATION — IRON RULE:  
-Discount KABHI NAHI — PKR 999 FINAL HAI  
-"Mehenga hai" → "Ek theme 5000+ ki, 100+ sirf 999 — PKR 10 per theme!"  
-"Kam karo" → "Bhai yeh already lowest — quality se compromise nahi hoga"  
-  
-SELLING:  
-- Value: "Market mein ek theme 5000+ ki hai, 100+ sirf PKR 999"  
-- Per unit: "Sirf PKR 10 per theme"  
-- FOMO: "Competitors already use kar rahe hain"  
-- ROI: "Ek sale se 999 wapas"  
+LANGUAGE:  
+Customer ki language follow karo (Urdu / Roman Urdu / English)  
   
 RULES:  
-- Short replies — 3-4 lines max  
-- Friendly emojis  
-- ORDER_READY bilkul start mein jab order ho`,  
-    broadcasts: [],  
+- Reply short: 3-4 lines max  
+- Friendly emojis use karo  
+- Price negotiation: Discount KABHI NAHI — PKR 999 final  
+- Jab customer BUY karna chahe: reply bilkul START mein "ORDER_READY" word se start karo  
+- ORDER_READY ke baad normal message do  
+  
+SELLING:  
+- Market mein ek theme 5000+ ki hoti hai; 100+ sirf PKR 999  
+- Sirf PKR 10 per theme  
+- Competitors already use kar rahe hain (FOMO)  
+  
+IMPORTANT:  
+- ORDER_READY sirf buy time par.  
+- Koi aur price mention na karna.`,  
     orders: {},  
-    customers: {},  
     orderCounter: 1000  
   };  
 }  
   
 let botData = getDefaultData();  
   
-// Load from Upstash first, fallback to local file  
+let saveInFlight = false;  
+let saveQueued = false;  
+let saveTimer = null;  
+  
+function requestSaveData(delayMs = 200) {  
+  if (saveTimer) clearTimeout(saveTimer);  
+  saveTimer = setTimeout(() => {  
+    saveTimer = null;  
+    runSaveData().catch(() => {});  
+  }, delayMs);  
+}  
+  
 async function loadData() {  
   try {  
-    const saved = upstashEnabled ? await redisGet(DATA_KEY) : null;  
-    if (saved) {  
-      botData = { ...getDefaultData(), ...saved };  
-      botData.customers = botData.customers || {};  
-      botData.broadcasts = botData.broadcasts || [];  
-      console.log('✅ Data loaded from Upstash!');  
-      return;  
+    if (upstashEnabled) {  
+      const saved = await redisGet(BOT_DATA_KEY);  
+      if (saved && typeof saved === 'object') {  
+        botData = { ...getDefaultData(), ...saved };  
+        botData.orders = botData.orders || {};  
+        botData.products = Array.isArray(botData.products) ? botData.products : getDefaultData().products;  
+        return;  
+      }  
     }  
-  
-    if (fs.existsSync(DATA_FILE)) {  
-      const saved2 = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));  
+    if (fs.existsSync(BOT_DATA_FILE)) {  
+      const saved2 = JSON.parse(fs.readFileSync(BOT_DATA_FILE, 'utf8'));  
       botData = { ...getDefaultData(), ...saved2 };  
-      botData.customers = botData.customers || {};  
-      botData.broadcasts = botData.broadcasts || [];  
-      console.log('✅ Data loaded from local file!');  
+      botData.orders = botData.orders || {};  
+      botData.products = Array.isArray(botData.products) ? botData.products : getDefaultData().products;  
     }  
   } catch (e) {  
     console.log('Load error:', e.message);  
   }  
 }  
   
-async function saveData() {  
+async function runSaveData() {  
+  if (saveInFlight) {  
+    saveQueued = true;  
+    return;  
+  }  
+  saveInFlight = true;  
+  saveQueued = false;  
+  
   try {  
-    if (upstashEnabled) await redisSet(DATA_KEY, botData);  
-    fs.writeFileSync(DATA_FILE, JSON.stringify(botData, null, 2));  
+    if (upstashEnabled) await redisSet(BOT_DATA_KEY, botData);  
+    fs.writeFileSync(BOT_DATA_FILE, JSON.stringify(botData, null, 2));  
   } catch (e) {  
     console.log('Save error:', e.message);  
+  } finally {  
+    saveInFlight = false;  
+    if (saveQueued) runSaveData().catch(() => {});  
   }  
 }  
   
-// ─────────────────────────────────────────// BOT STATE // ─────────────────────────────────────────  
-let currentQR = null;  
-let botStatus = 'starting';  
-let sockGlobal = null;  
-  
-const salesHistory = {}; // keyed by customerJid  
-let broadcastRunning = false;  
-  
-let existingChats = [];  
-let chatsLoaded = false;  
-let globalStore = null;  
-  
-// ─────────────────────────────────────────// AUTH / BODY UTILS // ─────────────────────────────────────────  
-function isAuthenticated(req) {  
-  const cookies = req.headers.cookie || '';  
-  const sessionMatch = cookies.match(/session=([^;]+)/);  
-  if (!sessionMatch) return false;  
-  return sessions[sessionMatch[1]] === true;  
+/* ─────────────────────────────  
+   LANGUAGE DETECTION  
+───────────────────────────── */  
+function detectLang(text) {  
+  if (!text) return 'roman_urdu';  
+  if (/[\u0600-\u06FF]/.test(text)) return 'urdu';  
+  if (  
+    /\b(kya|hai|haan|nahi|bhai|yar|chahiye|theek|acha|karo|dedo|batao|kitna|lena|mujhe|yrr)\b/i.test(  
+      text  
+    )  
+  )  
+    return 'roman_urdu';  
+  return 'english';  
 }  
   
-async function parseBody(req) {  
-  return new Promise((resolve) => {  
-    let body = '';  
-    req.on('data', (chunk) => (body += chunk.toString()));  
-    req.on('end', () => {  
-      try {  
-        resolve(JSON.parse(body || '{}'));  
-      } catch {  
-        resolve({});  
-      }  
-    });  
-  });  
+/* ─────────────────────────────  
+   UTIL: DIGITS + VALIDATORS  
+───────────────────────────── */  
+function digitsOnly(str) {  
+  return (str || '').toString().replace(/\D/g, '');  
 }  
   
-const sessions = {};  
-  
-// ─────────────────────────────────────────// CHATS PROCESSING // ─────────────────────────────────────────  
-function processChatsFromStore() {  
+/* ─────────────────────────────  
+   GOOGLE SHEETS (OPTIONAL)  
+───────────────────────────── */  
+async function getGoogleToken() {  
   try {  
-    if (!globalStore) {  
-      chatsLoaded = true;  
-      return;  
-    }  
-    const chats = globalStore.chats.all();  
-    const newChats = [];  
+    if (!GOOGLE_CLIENT_EMAIL || !GOOGLE_PRIVATE_KEY || !GOOGLE_SHEET_ID) return null;  
   
-    for (const chat of chats) {  
-      if (!chat.id) continue;  
-      if (chat.id.endsWith('@g.us')) continue;  
-      if (chat.id.endsWith('@broadcast')) continue;  
-      if (chat.id === 'status@broadcast') continue;  
-      if (chat.id.includes('newsletter')) continue;  
+    const now = Math.floor(Date.now() / 1000);  
   
-      const number = chat.id.replace('@s.whatsapp.net', '');  
-      if (number.length < 10) continue;  
+    const header = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url');  
+    const payload = Buffer.from(  
+      JSON.stringify({  
+        iss: GOOGLE_CLIENT_EMAIL,  
+        scope: 'https://www.googleapis.com/auth/spreadsheets',  
+        aud: 'https://oauth2.googleapis.com/token',  
+        exp: now + 3600,  
+        iat: now  
+      })  
+    ).toString('base64url');  
   
-      newChats.push({  
-        jid: chat.id,  
-        number,  
-        name: chat.name || chat.pushName || number,  
-        lastMessage: chat.conversationTimestamp || 0  
-      });  
-    }  
+    const sign = crypto.createSign('RSA-SHA256');  
+    sign.update(`${header}.${payload}`);  
   
-    newChats.sort((a, b) => b.lastMessage - a.lastMessage);  
-    existingChats = newChats;  
-    chatsLoaded = true;  
-    console.log(`✅ ${newChats.length} chats processed!`);  
-  } catch (e) {  
-    console.log('Chat process error:', e.message);  
-    chatsLoaded = true;  
+    const jwt = `${header}.${payload}.${sign.sign(GOOGLE_PRIVATE_KEY, 'base64url')}`;  
+  
+    const res = await axios.post('https://oauth2.googleapis.com/token', {  
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',  
+      assertion: jwt  
+    });  
+  
+    return res.data?.access_token || null;  
+  } catch {  
+    return null;  
   }  
 }  
   
-// ─────────────────────────────────────────// AI: COMMON MODEL CALLER // ─────────────────────────────────────────  
-const AI_CHAT_MODELS = [  
+async function initSheet() {  
+  try {  
+    const token = await getGoogleToken();  
+    if (!token) return;  
+  
+    const sheetId = GOOGLE_SHEET_ID;  
+  
+    await axios.post(  
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Sheet1!A1:append?valueInputOption=USER_ENTERED`,  
+      {  
+        values: [['Order ID', 'Customer', 'Phone', 'Product', 'Amount', 'Status', 'Language', 'Date']]  
+      },  
+      { headers: { Authorization: `Bearer ${token}` } }  
+    );  
+  } catch {  
+    // ignore  
+  }  
+}  
+  
+async function saveToSheet(data) {  
+  try {  
+    const token = await getGoogleToken();  
+    if (!token) return;  
+  
+    const sheetId = GOOGLE_SHEET_ID;  
+  
+    await axios.post(  
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/Sheet1!A:H:append?valueInputOption=USER_ENTERED`,  
+      {  
+        values: [  
+          [  
+            data.orderId || '',  
+            data.customerName || '',  
+            data.customerNumber || '',  
+            data.product || '',  
+            data.amount || '',  
+            data.status || '',  
+            data.language || '',  
+            new Date().toLocaleString('en-PK', { timeZone: 'Asia/Karachi' })  
+          ]  
+        ]  
+      },  
+      { headers: { Authorization: `Bearer ${token}` } }  
+    );  
+  } catch {  
+    // ignore  
+  }  
+}  
+  
+/* ─────────────────────────────  
+   VOICE -> TEXT (Groq Whisper)  
+───────────────────────────── */  
+async function voiceToText(audioBuffer) {  
+  try {  
+    const FormData = require('form-data');  
+    const form = new FormData();  
+    form.append('file', audioBuffer, { filename: 'audio.ogg', contentType: 'audio/ogg' });  
+    form.append('model', 'whisper-large-v3');  
+    form.append('response_format', 'json');  
+  
+    if (!GROQ_API_KEY) return null;  
+  
+    const res = await axios.post('https://api.groq.com/openai/v1/audio/transcriptions', form, {  
+      headers: { ...form.getHeaders(), Authorization: `Bearer ${GROQ_API_KEY}` },  
+      timeout: 30000  
+    });  
+  
+    return res.data?.text || null;  
+  } catch {  
+    return null;  
+  }  
+}  
+  
+/* ─────────────────────────────  
+   LLM CALL  
+───────────────────────────── */  
+const AI_MODELS = [  
   { provider: 'groq', model: 'llama-3.3-70b-versatile' },  
   { provider: 'groq', model: 'llama-3.1-8b-instant' },  
   { provider: 'groq', model: 'gemma2-9b-it' },  
-  { provider: 'groq', model: 'llama3-70b-8192' },  
   { provider: 'openrouter', model: 'meta-llama/llama-3.1-8b-instruct:free' },  
   { provider: 'openrouter', model: 'google/gemma-2-9b-it:free' },  
   { provider: 'openrouter', model: 'mistralai/mistral-7b-instruct:free' }  
 ];  
   
-function getLangRule(lang) {  
+async function callLLMChatCompletions(messages, { max_tokens = 300, temperature = 0.85 } = {}) {  
+  return withAiLock(async () => {  
+    for (const { provider, model } of AI_MODELS) {  
+      try {  
+        if (provider === 'groq' && !GROQ_API_KEY) continue;  
+        if (provider === 'openrouter' && !OPENROUTER_API_KEY) continue;  
+  
+        const apiUrl =  
+          provider === 'groq'  
+            ? 'https://api.groq.com/openai/v1/chat/completions'  
+            : 'https://openrouter.ai/api/v1/chat/completions';  
+  
+        const headers =  
+          provider === 'groq'  
+            ? { Authorization: `Bearer ${GROQ_API_KEY}`, 'Content-Type': 'application/json' }  
+            : {  
+                Authorization: `Bearer ${OPENROUTER_API_KEY}`,  
+                'Content-Type': 'application/json',  
+                'HTTP-Referer': 'https://mega-agency.com',  
+                'X-Title': 'Mega Agency'  
+              };  
+  
+        const response = await axios.post(  
+          apiUrl,  
+          { model, messages, max_tokens, temperature },  
+          { headers, timeout: 20000 }  
+        );  
+  
+        const content = response.data?.choices?.[0]?.message?.content;  
+        if (content && content.trim()) return content.trim();  
+      } catch {  
+        // try next model  
+      }  
+    }  
+    return null;  
+  });  
+}  
+  
+/* ─────────────────────────────  
+   AI SALES RESPONSE  
+───────────────────────────── */  
+const salesHistory = {}; // per customerJid  
+  
+function getActiveProduct() {  
+  return (botData.products || []).find((p) => p.active) || (botData.products || [])[0];  
+}  
+  
+function langRule(lang) {  
   if (lang === 'urdu') return 'Sirf Urdu script mein reply karo.';  
   if (lang === 'roman_urdu') return 'Roman Urdu mein reply karo.';  
   return 'English mein reply karo.';  
 }  
   
-async function callLLMChatCompletions(messages, { temperature = 0.85, max_tokens = 350 } = {}) {  
-  for (const { provider, model } of AI_CHAT_MODELS) {  
-    try {  
-      if (provider === 'groq' && !process.env.GROQ_API_KEY) continue;  
-      if (provider === 'openrouter' && !process.env.OPENROUTER_API_KEY) continue;  
-  
-      const apiUrl =  
-        provider === 'groq'  
-          ? 'https://api.groq.com/openai/v1/chat/completions'  
-          : 'https://openrouter.ai/api/v1/chat/completions';  
-  
-      const headers =  
-        provider === 'groq'  
-          ? { Authorization: `Bearer ${process.env.GROQ_API_KEY}`, 'Content-Type': 'application/json' }  
-          : {  
-              Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,  
-              'Content-Type': 'application/json',  
-              'HTTP-Referer': 'https://mega-agency.com',  
-              'X-Title': 'Mega Agency'  
-            };  
-  
-      const response = await axios.post(  
-        apiUrl,  
-        { model, messages, max_tokens, temperature },  
-        { headers, timeout: 15000 }  
-      );  
-  
-      const content = response.data?.choices?.[0]?.message?.content;  
-      if (content && content.trim()) {  
-        return { content: content.trim(), provider, model };  
-      }  
-    } catch {  
-      // try next model  
-    }  
-  }  
-  return null;  
-}  
-  
-function getActiveProduct() {  
-  return botData.products.find((p) => p.active) || botData.products[0];  
-}  
-  
-// ─────────────────────────────────────────// AI SALES RESPONSE (ORDER_READY detection kept) // ─────────────────────────────────────────  
 async function getAISalesResponse(userMessage, userId, customerName, lang) {  
+  if (!salesHistory[userId]) salesHistory[userId] = [];  
+  salesHistory[userId].push({ role: 'user', content: userMessage });  
+  if (salesHistory[userId].length > 30) salesHistory[userId] = salesHistory[userId].slice(-30);  
+  
+  const activeProduct = getActiveProduct();  
+  
+  const systemPrompt =  
+    (botData.aiPrompt || '') +  
+    `\n\n${langRule(lang)}` +  
+    `\nCustomer naam: ${customerName}` +  
+    `\nActive Product: ${activeProduct?.name || ''}` +  
+    `\nPrice: ${botData.settings.currency} ${activeProduct?.price || ''}` +  
+    `\nYAD RAKHO: Price kabhi kam nahi karo!`;  
+  
   try {  
-    if (!salesHistory[userId]) salesHistory[userId] = [];  
-  
-    salesHistory[userId].push({ role: 'user', content: userMessage });  
-    if (salesHistory[userId].length > 30) salesHistory[userId] = salesHistory[userId].slice(-30);  
-  
-    const activeProduct = getActiveProduct();  
-    const langRule = getLangRule(lang);  
-  
-    const systemPrompt =  
-      botData.aiPrompt +  
-      `\n\n${langRule}` +  
-      `\nCustomer naam: ${customerName}` +  
-      `\nActive Product: ${activeProduct.name}` +  
-      `\nPrice: ${botData.settings.currency} ${activeProduct.price}` +  
-      `\nYAD RAKHO: Price kabhi kam nahi karo!`;  
-  
-    const result = await callLLMChatCompletions(  
+    const aiText = await callLLMChatCompletions(  
       [{ role: 'system', content: systemPrompt }, ...salesHistory[userId]],  
-      { temperature: 0.85, max_tokens: 350 }  
+      { max_tokens: 320, temperature: 0.85 }  
     );  
   
-    if (!result?.content) {  
-      // cleanup the pushed user message  
-      if (salesHistory[userId]?.length) salesHistory[userId].pop();  
-      const fb = {  
-        urdu: '⚠️ تکنیکی مسئلہ — 1 منٹ بعد کوشش کریں! 🙏',  
-        roman_urdu: '⚠️ Thodi technical difficulty. 1 min mein dobara try karo! 🙏',  
-        english: '⚠️ Technical issue. Try again in 1 minute! 🙏'  
-      };  
-      return { message: fb[lang] || fb.roman_urdu, shouldOrder: false, product: activeProduct };  
-    }  
+    if (!aiText) throw new Error('LLM returned empty');  
   
-    const aiMessage = result.content;  
-    salesHistory[userId].push({ role: 'assistant', content: aiMessage });  
+    salesHistory[userId].push({ role: 'assistant', content: aiText });  
+    const shouldOrder = aiText.toUpperCase().includes('ORDER_READY');  
+    const cleanMessage = aiText.replace(/ORDER_READY/gi, '').trim();  
   
-    const shouldOrder = aiMessage.toUpperCase().includes('ORDER_READY');  
-    const cleanMessage = aiMessage.replace(/ORDER_READY/gi, '').trim();  
-  
-    console.log(`✅ AI: ${result.provider}/${result.model} | ${lang}`);  
     return { message: cleanMessage, shouldOrder, product: activeProduct };  
   } catch {  
-    const activeProduct = getActiveProduct();  
     const fb = {  
-      urdu: '⚠️ تکنیکی مسئلہ — 1 منٹ بعد کوشش کریں! 🙏',  
-      roman_urdu: '⚠️ Thodi technical difficulty. 1 min mein dobara try karo! 🙏',  
-      english: '⚠️ Technical issue. Try again in 1 minute! 🙏'  
+      urdu: '⚠️ Thodi technical difficulty. 1 minute mein dobara try karo 🙏',  
+      roman_urdu: '⚠️ Thodi technical difficulty. 1 minute mein dobara try karo 🙏',  
+      english: '⚠️ Technical difficulty. Try again in 1 minute 🙏'  
     };  
     return { message: fb[lang] || fb.roman_urdu, shouldOrder: false, product: activeProduct };  
   }  
 }  
   
-// ─────────────────────────────────────────// STATIC FALLBACK MESSAGES (used if AI fails validation) // ─────────────────────────────────────────  
+/* ─────────────────────────────  
+   AI SCENARIO MESSAGES (NO ORDER_READY)  
+───────────────────────────── */  
+async function getAIScenarioMessage({  
+  userId,  
+  customerName,  
+  lang,  
+  scenarioName,  
+  scenarioDetails,  
+  fallbackText  
+}) {  
+  const activeProduct = getActiveProduct();  
+  
+  const systemPrompt =  
+    (botData.aiPrompt || '') +  
+    `\n\n${langRule(lang)}` +  
+    `\nCustomer naam: ${customerName}` +  
+    `\nActive Product: ${activeProduct?.name || ''}` +  
+    `\nPrice: ${botData.settings.currency} ${activeProduct?.price || ''}` +  
+    `\n\nSCENARIO: ${scenarioName}\n${scenarioDetails}` +  
+    `\nIMPORTANT: ORDER_READY word bilkul mat likhna. Agar aa jaye to hata do.` +  
+    `\nReply short (3-5 lines). Emojis allowed.`;  
+  
+  const userPrompt = `SCENARIO=${scenarioName}\nLANG=${lang}\nDETAILS:\n${scenarioDetails}`;  
+  
+  try {  
+    const aiText = await callLLMChatCompletions(  
+      [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],  
+      { max_tokens: 240, temperature: 0.55 }  
+    );  
+  
+    if (!aiText) throw new Error('empty scenario');  
+  
+    const cleaned = aiText.replace(/ORDER_READY/gi, '').trim();  
+    return cleaned || fallbackText;  
+  } catch {  
+    return fallbackText;  
+  }  
+}  
+  
+/* ─────────────────────────────  
+   STATIC TEMPLATES + FALLBACKS  
+───────────────────────────── */  
 function getPaymentMessage(orderId, product, lang) {  
   const p = botData.payment;  
   const details = `━━━━━━━━━━━━━━━━━━━━💳 *Payment — ${botData.settings.currency} ${product.price}*  
@@ -703,663 +556,364 @@ Name: ${p.bank.accountName}
 IBAN: ${p.bank.iban}  
 ━━━━━━━━━━━━━━━━━━━━`;  
   
-  if (lang === 'urdu') {  
+  if (lang === 'urdu')  
     return `🛒 *آرڈر کنفرم! #${orderId}*\n\n${details}\n\n✅ پیمنٹ کے بعد اسکرین شاٹ بھیجیں\n⏳ 1 گھنٹے میں ڈلیوری!`;  
-  }  
-  if (lang === 'roman_urdu') {  
-    return `🛒 *Order Confirmed! #${orderId}*\nProduct: *${product.name}*\n\n${details}\n\n✅ Payment ke baad *screenshot* bhejo\n📦 1 hour mein delivery guaranteed!`;  
-  }  
+  if (lang === 'roman_urdu')  
+    return `🛒 *Order Confirmed! #${orderId}*\nProduct: *${product.name}*\n\n${details}\n\n✅ Payment ke baad *screenshot* bhejo\n📦 Delivery 1 hour mein guaranteed!`;  
   return `🛒 *Order Confirmed! #${orderId}*\nProduct: *${product.name}*\n\n${details}\n\n✅ Send screenshot after payment\n📦 Delivery within 1 hour!`;  
-}  
-  
-function getVoiceErrorStatic(lang) {  
-  if (lang === 'urdu') return `🎤 آپ کی آواز سمجھ نہیں آئی۔ براہِ کرم ٹیکسٹ میں لکھیں یا "buy" بھیجیں 🙏`;  
-  if (lang === 'roman_urdu') return `🎤 Aap ki voice samajh nahi aayi. Please text mein likhein ya "buy" bhejein 🙏`;  
-  return `🎤 I couldn't understand the voice. Please type your message or send "buy" 🙏`;  
 }  
   
 function getScreenshotReceivedStatic(orderId, lang) {  
   const msgs = {  
-    urdu: `📸 *اسکرین شاٹ موصول!*\n\nآرڈر *#${orderId}*\n✅ ایڈمن تصدیق کر رہا ہے\n⏳ 1 گھنٹے میں! 🙏`,  
-    roman_urdu: `📸 *Screenshot Receive Ho Gaya!*\n\nOrder *#${orderId}*\n✅ Admin verify kar raha hai\n⏳ 1 hour mein themes deliver honge!\n\nShukriya! 🙏`,  
-    english: `📸 *Screenshot Received!*\n\nOrder *#${orderId}*\n✅ Admin is verifying\n⏳ Delivery within 1 hour!\n\nThank you! 🙏`  
-  };  
-  return msgs[lang] || msgs.roman_urdu;  
-}  
-  
-function getScreenshotNoOrderStatic(lang) {  
-  const msgs = {  
-    urdu: `📸 Screenshot موصول ہو گیا!\n\nلیکن کوئی pending آرڈر نہیں ملا۔\nآرڈر start کرنے کیلئے براہِ کرم "buy" لکھیں 🙏`,  
-    roman_urdu: `📸 Screenshot mil gaya!\n\nLekin koi pending order nahi mila.\nOrder start karne ke liye please "buy" likho 🙏`,  
-    english: `📸 Screenshot received!\n\nBut I couldn't find a pending order.\nPlease type "buy" to start your order 🙏`  
+    urdu:  
+      `📸 *اسکرین شاٹ موصول!*\n\nآرڈر *#${orderId}*\n✅ Admin verify kar raha hai\n⏳ Delivery 1 hour mein! 🙏`,  
+    roman_urdu:  
+      `📸 *Screenshot Receive Ho Gaya!*\n\nOrder *#${orderId}*\n✅ Admin verify kar raha hai\n⏳ 1 hour mein delivery! 🙏`,  
+    english:  
+      `📸 *Screenshot Received!*\n\nOrder *#${orderId}*\n✅ Admin is verifying\n⏳ Delivery within 1 hour! 🙏`  
   };  
   return msgs[lang] || msgs.roman_urdu;  
 }  
   
 function getPaymentApprovedStatic(order, product, lang) {  
+  const downloadBlock = product?.downloadLink ? `\n\n⬇️ *Download Link:*\n${product.downloadLink}\n` : '';  
   const businessName = botData.settings.businessName || 'Mega Agency';  
-  const downloadBlock = product.downloadLink  
-    ? `⬇️ *Download Link:*\n${product.downloadLink}\n\n`  
-    : '';  
   
-  if (lang === 'urdu') {  
-    return `🎉 *پیمنٹ کنفرم!*\n\nآرڈر *#${order.orderId}* کنفرم ہو گیا!\n\n📦 *${product.name}*\n\n${downloadBlock}مدد چاہیے تو میسج کریں!\nشکریہ ${businessName} کو choose کرنے کا! 🙏`;  
-  }  
-  if (lang === 'roman_urdu') {  
-    return `🎉 *Payment Approved!*\n\nOrder *#${order.orderId}* confirm ho gaya!\n\n📦 *${product.name}*\n\n${downloadBlock}Koi help chahiye? toh message karo!\nShukriya ${businessName} ko choose karne ka! 🙏`;  
-  }  
-  return `🎉 *Payment Approved!*\n\nOrder *#${order.orderId}* confirmed!\n\n📦 *${product.name}*\n\n${downloadBlock}Any help needed? Message us!\nThanks for choosing ${businessName}! 🙏`;  
+  if (lang === 'urdu')  
+    return `🎉 *Payment Approved!*\n\nOrder *#${order.orderId}* confirm ho gaya!\n\n📦 *${product.name}*${downloadBlock}\n\nمدد چاہیے تو میسج کریں!\nشکریہ ${businessName} کو choose کرنے کا! 🙏`;  
+  
+  if (lang === 'roman_urdu')  
+    return `🎉 *Payment Approved!*\n\nOrder *#${order.orderId}* confirm ho gaya!\n\n📦 *${product.name}*${downloadBlock}\n\nKoi help chahiye? toh message karo!\nShukriya ${businessName} ko choose karne ka! 🙏`;  
+  
+  return `🎉 *Payment Approved!*\n\nOrder *#${order.orderId}* confirmed!\n\n📦 *${product.name}*${downloadBlock}\n\nAny help? Message us!\nThanks for choosing ${businessName}! 🙏`;  
 }  
   
 function getPaymentRejectedStatic(order, lang) {  
-  if (lang === 'urdu') {  
-    return `❌ *پیمنٹ ویریفائی نہیں ہو سکی*\n\nآرڈر *#${order.orderId}*\n\nScreenshot واضح نہیں تھا.\nبراہِ کرم دوبارہ سہی screenshot بھیجیں یا admin سے رابطہ کریں.\n\n"buy" لکھ کر دوبارہ try کریں 💪`;  
-  }  
-  if (lang === 'roman_urdu') {  
-    return `❌ *Payment Verify Nahi Ho Saki*\n\nOrder *#${order.orderId}*\n\nScreenshot sahi nahi tha.\nDobara sahi screenshot bhejo ya admin se contact karo.\n\n"buy" likhkar dobara try karo! 💪`;  
-  }  
+  if (lang === 'urdu')  
+    return `❌ *پیمنٹ ویریفائی نہیں ہو سکی*\n\nOrder *#${order.orderId}*\n\nScreenshot clear nahi tha.\nبراہِ کرم دوبارہ sahi screenshot bhejیں ya admin se contact کریں.\n\n"buy" لکھ کر try karo 💪`;  
+  
+  if (lang === 'roman_urdu')  
+    return `❌ *Payment Verify Nahi Ho Saki*\n\nOrder *#${order.orderId}*\n\nScreenshot sahi nahi tha.\nDobara sahi screenshot bhejo ya admin se contact karo.\n\n"buy" likhkar try karo 💪`;  
+  
   return `❌ *Payment Verify Failed*\n\nOrder *#${order.orderId}*\n\nScreenshot wasn't clear.\nPlease resend a correct screenshot or contact admin.\n\nType "buy" to try again 💪`;  
 }  
   
-function digitsOnly(str) {  
-  return (str || '').toString().replace(/\D/g, '');  
+/* ─────────────────────────────  
+   UPSTASH: WHATSAPP AUTH PERSISTENCE  
+───────────────────────────── */  
+function ensureDirSync(dir) {  
+  fs.mkdirSync(dir, { recursive: true });  
 }  
   
-function validatePaymentMessage(text, orderId) {  
-  try {  
-    const p = botData.payment;  
-    const msgDigits = digitsOnly(text);  
-    const idDigits = digitsOnly(String(orderId));  
-    const hasOrderId = idDigits && msgDigits.includes(idDigits);  
+function snapshotAuthDir(authDir) {  
+  const files = {};  
+  const stack = [authDir];  
   
-    const candidates = [  
-      p.easypaisa?.number,  
-      p.jazzcash?.number,  
-      p.bank?.accountNumber,  
-      p.bank?.iban  
-    ].filter(Boolean);  
+  while (stack.length) {  
+    const current = stack.pop();  
+    const entries = fs.readdirSync(current, { withFileTypes: true });  
   
-    const hasPayment =  
-      candidates.some((n) => {  
-        const dn = digitsOnly(n);  
-        if (!dn) return false;  
-        const part = dn.slice(-Math.min(10, dn.length)); // compare last chunk  
-        return part && msgDigits.includes(part);  
-      });  
-  
-    return hasOrderId && hasPayment;  
-  } catch {  
-    return false;  
-  }  
-}  
-  
-// ─────────────────────────────────────────// AI SCENARIO GENERATOR (all bot replies go through AI) // ─────────────────────────────────────────  
-async function getAIReplyScenario({  
-  userId,  
-  customerName,  
-  lang,  
-  product,  
-  scenarioName,  
-  scenarioInstructions,  
-  userPrompt,  
-  fallbackText,  
-  validateFn,  
-  temperature = 0.45,  
-  max_tokens = 450  
-}) {  
-  if (!salesHistory[userId]) salesHistory[userId] = [];  
-  
-  const activeProduct = product || getActiveProduct();  
-  const langRule = getLangRule(lang);  
-  
-  const systemPrompt =  
-    botData.aiPrompt +  
-    `\n\n${langRule}` +  
-    `\nCustomer naam: ${customerName}` +  
-    `\nActive Product: ${activeProduct?.name || ''}` +  
-    `\nPrice: ${botData.settings.currency} ${activeProduct?.price || ''}` +  
-    `\nYAD RAKHO: Price kabhi kam nahi karo!` +  
-    `\n\nSCENARIO: ${scenarioName}` +  
-    `\n${scenarioInstructions}` +  
-    `\nIMPORTANT: ORDER_READY word bilkul mat likhna. If it appears, remove it.`; // override  
-  
-  const history = (salesHistory[userId] || []).slice(-20);  
-  
-  const messages = [  
-    { role: 'system', content: systemPrompt },  
-    ...history,  
-    { role: 'user', content: userPrompt }  
-  ];  
-  
-  const result = await callLLMChatCompletions(messages, { temperature, max_tokens });  
-  
-  const finalFallback = fallbackText;  
-  
-  if (!result?.content) return finalFallback;  
-  
-  let text = result.content.trim().replace(/ORDER_READY/gi, '').trim();  
-  if (validateFn && !validateFn(text)) return finalFallback;  
-  
-  salesHistory[userId].push({ role: 'assistant', content: text });  
-  if (salesHistory[userId].length > 30) salesHistory[userId] = salesHistory[userId].slice(-30);  
-  
-  return text;  
-}  
-  
-async function getVoiceErrorMessageAI(userId, customerName, lang) {  
-  const fallbackText = getVoiceErrorStatic(lang);  
-  return (  
-    (await getAIReplyScenario({  
-      userId,  
-      customerName,  
-      lang,  
-      product: getActiveProduct(),  
-      scenarioName: 'VOICE_UNDERSTAND_ERROR',  
-      scenarioInstructions:  
-        'Customer ne voice bheji lekin text samajh nahi aaya. Friendly, short (max 3-4 lines) message do. Ask customer to type text. Mention "buy" as a quick option.',  
-      userPrompt: 'VOICE WAS NOT UNDERSTOOD. GENERATE ERROR + NEXT-STEP MESSAGE.',  
-      fallbackText  
-    })) || fallbackText  
-  );  
-}  
-  
-async function getScreenshotReceivedMessageAI({ userId, customerName, lang, orderId, product }) {  
-  const fallbackText = getScreenshotReceivedStatic(orderId, lang);  
-  return (  
-    (await getAIReplyScenario({  
-      userId,  
-      customerName,  
-      lang,  
-      product,  
-      scenarioName: 'PAYMENT_SCREENSHOT_RECEIVED',  
-      scenarioInstructions:  
-        `Customer ne payment screenshot bhej diya hai for Order #${orderId}. Confirm receipt. Admin verify + delivery within 1 hour mention karo. Short (3-5 lines). Emojis. Do NOT include payment numbers again.`,  
-      userPrompt: `OrderId: ${orderId}\nPayment screenshot received. Please respond accordingly.`,  
-      fallbackText,  
-      validateFn: (t) => digitsOnly(t).includes(digitsOnly(orderId))  
-    })) || fallbackText  
-  );  
-}  
-  
-async function getScreenshotNoOrderMessageAI({ userId, customerName, lang }) {  
-  const fallbackText = getScreenshotNoOrderStatic(lang);  
-  return (  
-    (await getAIReplyScenario({  
-      userId,  
-      customerName,  
-      lang,  
-      product: getActiveProduct(),  
-      scenarioName: 'SCREENSHOT_RECEIVED_NO_PENDING_ORDER',  
-      scenarioInstructions:  
-        'Customer ne screenshot bhej diya lekin pending order nahi mila. Customer ko "buy" likhne ko bolo taake order start ho. Friendly and short (3-4 lines).',  
-      userPrompt: 'Screenshot received but no pending order exists in system.',  
-      fallbackText  
-    })) || fallbackText  
-  );  
-}  
-  
-async function getPaymentMessageAI({ userId, customerName, lang, orderId, product }) {  
-  const fallbackText = getPaymentMessage(orderId, product, lang);  
-  
-  const p = botData.payment;  
-  const paymentBlock = `EasyPaisa: ${p.easypaisa.number} (Name: ${p.easypaisa.name})  
-JazzCash: ${p.jazzcash.number} (Name: ${p.jazzcash.name})  
-Bank: ${p.bank.bankName}, Account: ${p.bank.accountNumber}, Name: ${p.bank.accountName}, IBAN: ${p.bank.iban}`;  
-  
-  const scenarioInstructions =  
-    `This is PAYMENT REQUEST step. Must include payment instructions and ask customer to send screenshot after payment.\n` +  
-    `FINAL PRICE ONLY: ${botData.settings.currency} ${product.price}\n` +  
-    `Do NOT ask niche questions. Do NOT output ORDER_READY.\n` +  
-    `Keep message clear with emojis. Mention delivery within 1 hour.\n` +  
-    `Include payment details EXACTLY (numbers must match).`;  
-  
-  const userPrompt =  
-    `Order Confirmed.\nOrderId: ${orderId}\nProduct: ${product.name}\nPrice: ${botData.settings.currency} ${product.price}\n` +  
-    `Payment details (must include):\n${paymentBlock}\n` +  
-    `Now write the WhatsApp message in the customer's language: ${lang}.`;  
-  
-  const validateFn = (text) => validatePaymentMessage(text, orderId);  
-  
-  try {  
-    const aiText = await getAIReplyScenario({  
-      userId,  
-      customerName,  
-      lang,  
-      product,  
-      scenarioName: 'PAYMENT_REQUEST',  
-      scenarioInstructions,  
-      userPrompt,  
-      fallbackText,  
-      validateFn,  
-      temperature: 0.35,  
-      max_tokens: 520  
-    });  
-    return aiText || fallbackText;  
-  } catch {  
-    return fallbackText;  
-  }  
-}  
-  
-async function getPaymentApprovedMessageAI({ userId, customerName, lang, order, product }) {  
-  const fallbackText = getPaymentApprovedStatic(order, product, lang);  
-  
-  const scenarioInstructions =  
-    `PAYMENT APPROVED step.\n` +  
-    `Confirm order is confirmed for Order #${order.orderId}.\n` +  
-    `Mention product name.\n` +  
-    `If downloadLink exists, include it.\n` +  
-    `Short friendly message. Do NOT output ORDER_READY.`;  
-  
-  const userPrompt =  
-    `OrderId: ${order.orderId}\nProduct: ${product.name}\nDownloadLink: ${product.downloadLink || ''}\nBusiness: ${botData.settings.businessName}\n` +  
-    `Generate approved message in language: ${lang}.`;  
-  
-  const validateFn = (t) => {  
-    const okOrder = digitsOnly(t).includes(digitsOnly(order.orderId));  
-    const okProduct = product?.name ? t.includes(product.name) || t.toLowerCase().includes(product.name.toLowerCase().slice(0, 8)) : true;  
-    const okDownload = product?.downloadLink ? t.includes(product.downloadLink) : true;  
-    return okOrder && okProduct && okDownload;  
-  };  
-  
-  try {  
-    const aiText = await getAIReplyScenario({  
-      userId,  
-      customerName,  
-      lang,  
-      product,  
-      scenarioName: 'PAYMENT_APPROVED',  
-      scenarioInstructions,  
-      userPrompt,  
-      fallbackText,  
-      validateFn,  
-      temperature: 0.35,  
-      max_tokens: 480  
-    });  
-    return aiText || fallbackText;  
-  } catch {  
-    return fallbackText;  
-  }  
-}  
-  
-async function getPaymentRejectedMessageAI({ userId, customerName, lang, order }) {  
-  const fallbackText = getPaymentRejectedStatic(order, lang);  
-  
-  const scenarioInstructions =  
-    `PAYMENT REJECTED step.\n` +  
-    `Order #${order.orderId} screenshot not verified. Apologize and ask customer to resend correct screenshot or contact admin.\n` +  
-    `Mention instruction: type "buy" to try again.\n` +  
-    `Short friendly message. Do NOT output ORDER_READY.`;  
-  
-  const userPrompt =  
-    `OrderId: ${order.orderId}\nGenerate rejected message in language: ${lang}.`;  
-  
-  const validateFn = (t) => digitsOnly(t).includes(digitsOnly(order.orderId));  
-  
-  try {  
-    const aiText = await getAIReplyScenario({  
-      userId,  
-      customerName,  
-      lang,  
-      product: getActiveProduct(),  
-      scenarioName: 'PAYMENT_REJECTED',  
-      scenarioInstructions,  
-      userPrompt,  
-      fallbackText,  
-      validateFn,  
-      temperature: 0.45,  
-      max_tokens: 420  
-    });  
-    return aiText || fallbackText;  
-  } catch {  
-    return fallbackText;  
-  }  
-}  
-  
-// ─────────────────────────────────────────// DASHBOARD: AI BROADCAST GENERATOR (kept) // ─────────────────────────────────────────  
-async function generateBroadcastMessage(offerDetails, customerName, personalized) {  
-  const models = [  
-    { provider: 'groq', model: 'llama-3.3-70b-versatile' },  
-    { provider: 'groq', model: 'llama-3.1-8b-instant' },  
-    { provider: 'openrouter', model: 'meta-llama/llama-3.1-8b-instruct:free' }  
-  ];  
-  
-  const prompt = personalized  
-    ? `WhatsApp marketing message likho "${customerName}" ke liye.\nOffer: ${offerDetails}\nRules: Roman Urdu, 3-5 lines, compelling, naam use karo, emojis, price clear karo, call to action.`  
-    : `WhatsApp marketing message likho.\nOffer: ${offerDetails}\nRules: Roman Urdu, 3-5 lines, compelling, emojis, price clear karo, call to action.`;  
-  
-  for (const { provider, model } of models) {  
-    try {  
-      const apiUrl =  
-        provider === 'groq'  
-          ? 'https://api.groq.com/openai/v1/chat/completions'  
-          : 'https://openrouter.ai/api/v1/chat/completions';  
-  
-      const headers =  
-        provider === 'groq'  
-          ? {  
-              Authorization: `Bearer ${process.env.GROQ_API_KEY}`,  
-              'Content-Type': 'application/json'  
-            }  
-          : {  
-              Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,  
-              'Content-Type': 'application/json',  
-              'HTTP-Referer': 'https://mega-agency.com',  
-              'X-Title': 'Mega Agency'  
-            };  
-  
-      const res = await axios.post(  
-        apiUrl,  
-        {  
-          model,  
-          messages: [{ role: 'user', content: prompt }],  
-          max_tokens: 200,  
-          temperature: 0.9  
-        },  
-        { headers, timeout: 15000 }  
-      );  
-  
-      return res.data?.choices?.[0]?.message?.content?.trim() || offerDetails;  
-    } catch {  
-      // next  
-    }  
-  }  
-  return offerDetails;  
-}  
-  
-async function runBroadcast(broadcast) {  
-  if (!sockGlobal) return;  
-  
-  broadcastRunning = true;  
-  
-  const targets = broadcast.selectedContacts || [];  
-  let sent = 0;  
-  let failed = 0;  
-  
-  broadcast.status = 'running';  
-  broadcast.sentCount = 0;  
-  broadcast.failedCount = 0;  
-  
-  await saveData();  
-  
-  for (const contact of targets) {  
-    try {  
-      let message = broadcast.baseMessage;  
-  
-      if (broadcast.personalized && broadcast.offerDetails) {  
-        message = await generateBroadcastMessage(  
-          broadcast.offerDetails,  
-          contact.name || 'Dost',  
-          true  
-        );  
+    for (const ent of entries) {  
+      const full = path.join(current, ent.name);  
+      if (ent.isDirectory()) {  
+        stack.push(full);  
+        continue;  
       }  
+      if (!ent.isFile()) continue;  
   
-      await sockGlobal.sendMessage(contact.jid, { text: message });  
-  
-      sent++;  
-      broadcast.sentCount = sent;  
-      console.log(`📤 Sent ${sent}/${targets.length} → ${contact.name || contact.number}`);  
-  
-      await new Promise((r) => setTimeout(r, (broadcast.delaySeconds || 5) * 1000));  
-    } catch {  
-      failed++;  
-      broadcast.failedCount = failed;  
+      const rel = path.relative(authDir, full).replace(/\\/g, '/');  
+      const buf = fs.readFileSync(full);  
+      files[rel] = buf.toString('base64');  
     }  
   }  
   
-  broadcast.status = 'completed';  
-  broadcast.completedAt = Date.now();  
-  await saveData();  
-  
-  broadcastRunning = false;  
-  console.log(`✅ Broadcast done! Sent:${sent} Failed:${failed}`);  
+  return files;  
 }  
   
-// ─────────────────────────────────────────// MESSAGE HANDLER (ALL CUSTOMER REPLIES VIA AI) // ─────────────────────────────────────────  
-async function handleMessage(sock, message) {  
+async function restoreWhatsAppAuthFromUpstash() {  
+  if (!upstashEnabled) return;  
+  
   try {  
-    if (message.key.fromMe) return;  
+    ensureDirSync(WA_AUTH_DIR);  
   
-    const senderId = message.key?.remoteJid;  
-    if (!senderId) return;  
+    const snap = await redisGet(WA_AUTH_SNAPSHOT_KEY);  
+    if (snap?.data) {  
+      const gz = Buffer.from(snap.data, 'base64');  
+      const jsonBuf = zlib.gunzipSync(gz);  
+      const parsed = JSON.parse(jsonBuf.toString('utf8'));  
   
-    if (senderId === 'status@broadcast') return;  
-    if (senderId.endsWith('@broadcast')) return;  
-    if (senderId.includes('newsletter')) return;  
-    if (senderId.endsWith('@g.us')) return;  
+      if (parsed?.files && typeof parsed.files === 'object') {  
+        fs.rmSync(WA_AUTH_DIR, { recursive: true, force: true });  
+        ensureDirSync(WA_AUTH_DIR);  
   
-    const senderName = message.pushName || 'Customer';  
-    const msgType = Object.keys(message.message || {})[0];  
-  
-    // Save/update customer  
-    if (!botData.customers) botData.customers = {};  
-    botData.customers[senderId] = botData.customers[senderId] || {  
-      jid: senderId,  
-      number: senderId.replace('@s.whatsapp.net', ''),  
-      name: senderName,  
-      lastSeen: Date.now(),  
-      language: 'roman_urdu'  
-    };  
-    botData.customers[senderId].jid = senderId;  
-    botData.customers[senderId].number = senderId.replace('@s.whatsapp.net', '');  
-    botData.customers[senderId].name = senderName;  
-    botData.customers[senderId].lastSeen = Date.now();  
-  
-    // VOICE  
-    if (msgType === 'audioMessage' || msgType === 'pttMessage') {  
-      const currentLang = botData.customers[senderId]?.language || 'roman_urdu';  
-      await sock.sendPresenceUpdate('composing', senderId);  
-  
-      try {  
-        const buf = await downloadMediaMessage(message, 'buffer', {});  
-        const text = await voiceToText(buf);  
-  
-        if (text && text.trim()) {  
-          const lang = detectLang(text);  
-          botData.customers[senderId].language = lang;  
-          await saveData();  
-  
-          const ai = await getAISalesResponse(text, senderId, senderName, lang);  
-  
-          await sock.sendPresenceUpdate('paused', senderId);  
-  
-          // AI reply (no static prefix so this reply is fully AI-driven)  
-          if (ai.message && ai.message.trim()) {  
-            await sock.sendMessage(senderId, { text: ai.message }, { quoted: message });  
-            await new Promise((r) => setTimeout(r, 600));  
-          }  
-  
-          if (ai.shouldOrder) {  
-            botData.orderCounter++;  
-            const orderId = botData.orderCounter;  
-  
-            const product = ai.product || getActiveProduct();  
-            botData.orders[senderId] = {  
-              orderId,  
-              customerJid: senderId,  
-              customerNumber: senderId.replace('@s.whatsapp.net', ''),  
-              customerName: senderName,  
-              productId: product?.id,  
-              language: lang,  
-              status: 'pending',  
-              hasScreenshot: false,  
-              timestamp: Date.now()  
-            };  
-  
-            await saveData();  
-  
-            const paymentMsg = await getPaymentMessageAI({  
-              userId: senderId,  
-              customerName: senderName,  
-              lang,  
-              orderId,  
-              product  
-            });  
-  
-            await sock.sendMessage(senderId, { text: paymentMsg });  
-            console.log(`🛒 New Order: #${orderId} for ${senderName}`);  
-            await saveToSheet({  
-              orderId,  
-              customerName: senderName,  
-              customerNumber: senderId.replace('@s.whatsapp.net', ''),  
-              product: product?.name,  
-              amount: product?.price,  
-              status: 'pending',  
-              language: lang  
-            });  
-          }  
-  
-          return;  
+        for (const [relPath, contentB64] of Object.entries(parsed.files)) {  
+          const fullPath = path.join(WA_AUTH_DIR, relPath);  
+          ensureDirSync(path.dirname(fullPath));  
+          fs.writeFileSync(fullPath, Buffer.from(contentB64, 'base64'));  
         }  
-  
-        // voice not understood -> AI error message  
-        const errMsg = await getVoiceErrorMessageAI(senderId, senderName, currentLang);  
-        await sock.sendPresenceUpdate('paused', senderId);  
-        await sock.sendMessage(senderId, { text: errMsg }, { quoted: message });  
-      } catch {  
-        const errMsg = await getVoiceErrorMessageAI(senderId, senderName, currentLang);  
-        await sock.sendPresenceUpdate('paused', senderId);  
-        await sock.sendMessage(senderId, { text: errMsg }, { quoted: message });  
+        console.log('✅ WhatsApp auth restored from Upstash snapshot');  
+        return;  
       }  
-      return;  
+    }  
+  } catch (e) {  
+    console.log('Auth snapshot restore failed:', e.message);  
+  }  
+  
+  try {  
+    const creds = await redisGet(WA_AUTH_CREDS_KEY);  
+    if (creds) {  
+      ensureDirSync(WA_AUTH_DIR);  
+      const credsPath = path.join(WA_AUTH_DIR, 'creds.json');  
+      fs.writeFileSync(credsPath, JSON.stringify(creds, null, 2));  
+      console.log('✅ WhatsApp creds.json restored from Upstash');  
+    }  
+  } catch {  
+    // ignore  
+  }  
+}  
+  
+let authPersistInProgress = false;  
+let authPersistQueued = false;  
+let lastCredsPersistAt = 0;  
+let lastSnapshotAt = 0;  
+  
+async function persistWhatsAppAuthToUpstash() {  
+  if (!upstashEnabled) return;  
+  
+  if (authPersistInProgress) {  
+    authPersistQueued = true;  
+    return;  
+  }  
+  authPersistInProgress = true;  
+  authPersistQueued = false;  
+  
+  try {  
+    const credsPath = path.join(WA_AUTH_DIR, 'creds.json');  
+    if (!fs.existsSync(credsPath)) return;  
+  
+    const now = Date.now();  
+    const credsThrottleMs = parseInt(process.env.WHATSAPP_UPSTASH_CREDS_THROTTLE_MS || '5000', 10);  
+    const shouldPersistCreds = !lastCredsPersistAt || now - lastCredsPersistAt >= credsThrottleMs;  
+  
+    if (shouldPersistCreds) {  
+      const creds = JSON.parse(fs.readFileSync(credsPath, 'utf8'));  
+      await redisSet(WA_AUTH_CREDS_KEY, creds);  
+      lastCredsPersistAt = now;  
     }  
   
-    // IMAGE (screenshot)  
-    if (msgType === 'imageMessage') {  
-      const existingOrder = Object.values(botData.orders || {}).find(  
-        (o) => o.customerJid === senderId && o.status === 'pending'  
-      );  
+    const shouldSnapshot =  
+      WHATSAPP_UPSTASH_SAVE_SNAPSHOT &&  
+      now - lastSnapshotAt >= WHATSAPP_UPSTASH_SNAPSHOT_INTERVAL_MS;  
   
-      const lang = botData.customers[senderId]?.language || 'roman_urdu';  
+    if (shouldSnapshot) {  
+      const files = snapshotAuthDir(WA_AUTH_DIR);  
+      const payload = JSON.stringify({ v: 1, files });  
   
-      if (existingOrder) {  
-        existingOrder.hasScreenshot = true;  
-        await saveData();  
-  
-        const product =  
-          botData.products.find((p) => p.id === existingOrder.productId) || botData.products[0];  
-  
-        const aiMsg = await getScreenshotReceivedMessageAI({  
-          userId: senderId,  
-          customerName: senderName,  
-          lang,  
-          orderId: existingOrder.orderId,  
-          product  
-        });  
-  
-        await sock.sendMessage(senderId, { text: aiMsg });  
-  
-        // Admin notification (internal - not requested as AI)  
-        const adminJid = botData.settings.adminNumber  
-          ? `${botData.settings.adminNumber}@s.whatsapp.net`  
-          : null;  
-  
-        if (adminJid) {  
-          try {  
-            await sock.sendMessage(adminJid, {  
-              text: `🔔 New Payment Screenshot!\n\nOrder: *#${existingOrder.orderId}*\nCustomer: ${senderName}\nNumber: ${existingOrder.customerNumber}\n\nDashboard pe approve/reject karo! ⚡`  
-            });  
-          } catch {  
-            // ignore  
-          }  
-        }  
+      const gz = zlib.gzipSync(Buffer.from(payload, 'utf8'), { level: 9 });  
+      if (gz.length <= WHATSAPP_UPSTASH_SNAPSHOT_MAX_BYTES) {  
+        await redisSet(WA_AUTH_SNAPSHOT_KEY, { v: 1, data: gz.toString('base64'), t: Date.now() });  
+        lastSnapshotAt = now;  
       } else {  
-        const aiMsg = await getScreenshotNoOrderMessageAI({  
-          userId: senderId,  
-          customerName: senderName,  
-          lang  
-        });  
-        await sock.sendMessage(senderId, { text: aiMsg }, { quoted: message });  
+        // too big; keep only creds.json  
       }  
-      return;  
     }  
+  } catch (e) {  
+    console.log('Auth persist error:', e.message);  
+  } finally {  
+    authPersistInProgress = false;  
+    if (authPersistQueued) persistWhatsAppAuthToUpstash().catch(() => {});  
+  }  
+}  
   
-    // TEXT  
-    const userMessage =  
-      message.message?.conversation ||  
-      message.message?.extendedTextMessage?.text ||  
-      '';  
+async function clearWhatsAppAuthInUpstash() {  
+  if (!upstashEnabled) return;  
+  await redisDel(WA_AUTH_CREDS_KEY);  
+  await redisDel(WA_AUTH_SNAPSHOT_KEY);  
+}  
   
-    if (!userMessage.trim()) return;  
+/* ─────────────────────────────  
+   WHATSAPP BOT  
+───────────────────────────── */  
+let currentQR = null;  
+let botStatus = 'starting';  
+let sockGlobal = null;  
   
-    const lang = detectLang(userMessage);  
-    botData.customers[senderId].language = lang;  
-    await saveData();  
+const perJidQueue = new Map();  
+function enqueueForJid(jid, task) {  
+  const prev = perJidQueue.get(jid) || Promise.resolve();  
+  const next = prev  
+    .then(task)  
+    .catch((e) => console.error('Task error for', jid, e?.message || e))  
+    .finally(() => {  
+      if (perJidQueue.get(jid) === next) perJidQueue.delete(jid);  
+    });  
+  perJidQueue.set(jid, next);  
+  return next;  
+}  
   
-    console.log(`📩 ${senderName}[${lang}]: ${userMessage}`);  
+function getAdminJid() {  
+  const n = botData?.settings?.adminNumber;  
+  if (!n) return null;  
+  // Accept either "923..." or already with @s.whatsapp.net  
+  if (n.includes('@s.whatsapp.net')) return n;  
+  return n + '@s.whatsapp.net';  
+}  
   
-    await sock.sendPresenceUpdate('composing', senderId);  
+async function handleTextMessage(sock, message, senderId, senderName) {  
+  const userMessage =  
+    message.message?.conversation || message.message?.extendedTextMessage?.text || '';  
   
-    const aiReply = await getAISalesResponse(userMessage, senderId, senderName, lang);  
+  if (!userMessage || !userMessage.trim()) return;  
   
-    await sock.sendPresenceUpdate('paused', senderId);  
+  const lang = detectLang(userMessage);  
   
-    if (aiReply.shouldOrder) {  
+  await sock.sendPresenceUpdate('composing', senderId);  
+  const aiReply = await getAISalesResponse(userMessage, senderId, senderName, lang);  
+  await sock.sendPresenceUpdate('paused', senderId);  
+  
+  if (aiReply.message) {  
+    await sock.sendMessage(senderId, { text: aiReply.message }, { quoted: message }).catch(() => {});  
+  }  
+  
+  if (aiReply.shouldOrder) {  
+    const activeProduct = aiReply.product || getActiveProduct();  
+  
+    // If pending order already exists, reuse it  
+    const existingPending = botData.orders[senderId];  
+    let order;  
+  
+    if (existingPending && existingPending.status === 'pending') {  
+      order = existingPending;  
+      order.language = lang;  
+    } else {  
       botData.orderCounter++;  
-      const orderId = botData.orderCounter;  
-  
-      const product = aiReply.product || getActiveProduct();  
-  
-      botData.orders[senderId] = {  
-        orderId,  
+      order = {  
+        orderId: botData.orderCounter,  
         customerJid: senderId,  
         customerNumber: senderId.replace('@s.whatsapp.net', ''),  
         customerName: senderName,  
-        productId: product?.id,  
+        productId: activeProduct?.id,  
         language: lang,  
         status: 'pending',  
         hasScreenshot: false,  
         timestamp: Date.now()  
       };  
-  
-      await saveData();  
-      await saveToSheet({  
-        orderId,  
-        customerName: senderName,  
-        customerNumber: senderId.replace('@s.whatsapp.net', ''),  
-        product: product?.name,  
-        amount: product?.price,  
-        status: 'pending',  
-        language: lang  
-      });  
-  
-      if (aiReply.message && aiReply.message.trim()) {  
-        await sock.sendMessage(senderId, { text: aiReply.message }, { quoted: message });  
-        await new Promise((r) => setTimeout(r, 800));  
-      }  
-  
-      const paymentMsg = await getPaymentMessageAI({  
-        userId: senderId,  
-        customerName: senderName,  
-        lang,  
-        orderId,  
-        product  
-      });  
-  
-      await sock.sendMessage(senderId, { text: paymentMsg });  
-      console.log(`🛒 New Order: #${orderId} for ${senderName}`);  
-    } else {  
-      if (aiReply.message && aiReply.message.trim()) {  
-        await sock.sendMessage(senderId, { text: aiReply.message }, { quoted: message });  
-      }  
+      botData.orders[senderId] = order;  
     }  
-  } catch (err) {  
-    console.error('Handle error:', err?.message || err);  
+  
+    requestSaveData();  
+  
+    const productForOrder =  
+      (botData.products || []).find((p) => p.id === order.productId) || activeProduct || (botData.products || [])[0];  
+  
+    // Save pending to sheet (optional)  
+    saveToSheet({  
+      orderId: order.orderId,  
+      customerName: order.customerName,  
+      customerNumber: order.customerNumber,  
+      product: productForOrder?.name || '',  
+      amount: productForOrder?.price || '',  
+      status: 'pending',  
+      language: order.language  
+    }).catch(() => {});  
+  
+    await new Promise((r) => setTimeout(r, 700));  
+    const payMsg = getPaymentMessage(order.orderId, productForOrder, lang);  
+    await sock.sendMessage(senderId, { text: payMsg });  
   }  
 }  
   
-// ─────────────────────────────────────────// WHATSAPP BOT START // ─────────────────────────────────────────  
-async function startBot() {  
-  try {  
-    const { version, isLatest } = await fetchLatestBaileysVersion();  
-    console.log(`📱 WA Version: ${version.join('.')} — Latest: ${isLatest}`);  
+async function handleVoiceMessage(sock, message, senderId, senderName) {  
+  await sock.sendPresenceUpdate('composing', senderId);  
   
-    await restoreWhatsAppAuthFromUpstash();  
+  try {  
+    const buf = await downloadMediaMessage(message, 'buffer', {});  
+    const text = await voiceToText(buf);  
+  
+    if (!text || !text.trim()) {  
+      const fallback = '🎤 Voice samajh nahi aayi. Please text mein likhein ya "buy" bhej dein 🙏';  
+      await sock.sendPresenceUpdate('paused', senderId);  
+      await sock.sendMessage(senderId, { text: fallback }, { quoted: message });  
+      return;  
+    }  
+  
+    const lang = detectLang(text);  
+  
+    await sock.sendPresenceUpdate('paused', senderId);  
+  
+    // Let AI craft the reply using the transcription as user input  
+    await handleTextMessage(sock, { ...message, message: { ...message.message, conversation: text } }, senderId, senderName);  
+  } catch {  
+    await sock.sendPresenceUpdate('paused', senderId).catch(() => {});  
+    await sock.sendMessage(senderId, { text: '⚠️ Voice error. Please try again or send text 🙏' }, { quoted: message });  
+  }  
+}  
+  
+async function handleImageMessage(sock, message, senderId, senderName) {  
+  const order = botData.orders[senderId];  
+  
+  const lang = order?.language || 'roman_urdu';  
+  
+  if (order && order.status === 'pending') {  
+    order.hasScreenshot = true;  
+    requestSaveData();  
+  
+    const fallback = getScreenshotReceivedStatic(order.orderId, lang);  
+  
+    const scenarioDetails =  
+      `Customer ne payment screenshot bhej diya hai.\n` +  
+      `Order: #${order.orderId}\n` +  
+      `Status: Admin is verifying.\n` +  
+      `Delivery: 1 hour.\n` +  
+      `Customer ko short message do (3-4 lines), emojis, do NOT include payment numbers, do NOT output ORDER_READY.`;  
+  
+    const aiMsg = await getAIScenarioMessage({  
+      userId: senderId,  
+      customerName: senderName,  
+      lang,  
+      scenarioName: 'PAYMENT_SCREENSHOT_RECEIVED',  
+      scenarioDetails,  
+      fallbackText: fallback  
+    });  
+  
+    await sock.sendMessage(senderId, { text: aiMsg });  
+  
+    // Notify admin (internal)  
+    const adminJid = getAdminJid();  
+    if (adminJid) {  
+      await sock  
+        .sendMessage(adminJid, {  
+          text:  
+            `🔔 *New Payment Screenshot!*\n\n` +  
+            `Order: *#${order.orderId}*\nCustomer: ${senderName}\nNumber: ${order.customerNumber}\n\n` +  
+            `Dashboard pe approve/reject karo ⚡`  
+        })  
+        .catch(() => {});  
+    }  
+  
+    return;  
+  }  
+  
+  // No pending order -> treat as conversation (AI)  
+  const aiReply = await getAISalesResponse('[Customer ne screenshot bheja bina pending order ke]', senderId, senderName, lang);  
+  if (aiReply.message) await sock.sendMessage(senderId, { text: aiReply.message }, { quoted: message }).catch(() => {});  
+}  
+  
+/* ─────────────────────────────  
+   Start Bot  
+───────────────────────────── */  
+async function startBot() {  
+  botStatus = 'starting';  
+  
+  try {  
+    const { version } = await fetchLatestBaileysVersion();  
+  
+    currentQR = null;  
   
     ensureDirSync(WA_AUTH_DIR);  
+    await restoreWhatsAppAuthFromUpstash();  
   
-    const { state, saveCreds: originalSaveCreds } = await useMultiFileAuthState(WA_AUTH_DIR);  
-  
-    globalStore = makeInMemoryStore({ logger: pino({ level: 'silent' }) });  
+    const { state, saveCreds } = await useMultiFileAuthState(WA_AUTH_DIR);  
   
     const sock = makeWASocket({  
       version,  
@@ -1379,12 +933,14 @@ async function startBot() {
       syncFullHistory: false  
     });  
   
-    globalStore.bind(sock.ev);  
     sockGlobal = sock;  
   
-    sock.ev.on('creds.update', async () => {  
-      await originalSaveCreds();  
-      await persistWhatsAppAuthToUpstashThrottled(false);  
+    sock.ev.on('creds.update', () => {  
+      try {  
+        Promise.resolve(saveCreds()).catch(() => {});  
+      } finally {  
+        persistWhatsAppAuthToUpstash().catch(() => {});  
+      }  
     });  
   
     sock.ev.on('connection.update', async (update) => {  
@@ -1393,901 +949,724 @@ async function startBot() {
       if (qr) {  
         currentQR = qr;  
         botStatus = 'qr_ready';  
-        console.log('✅ QR Ready! /qr pe jao scan karne ke liye!');  
+        console.log('✅ QR Ready! Open /qr to scan');  
       }  
   
       if (connection === 'close') {  
         currentQR = null;  
-        const code = lastDisconnect?.error?.output?.statusCode;  
   
-        console.log('❌ Disconnected, code:', code);  
+        const code = lastDisconnect?.error?.output?.statusCode;  
+        console.log('❌ Connection closed:', code);  
   
         if (code === DisconnectReason.loggedOut) {  
           botStatus = 'logged_out';  
-  
           try {  
             fs.rmSync(WA_AUTH_DIR, { recursive: true, force: true });  
           } catch {}  
   
-          try {  
-            await clearWhatsAppAuthInUpstash();  
-          } catch {}  
+          if (WHATSAPP_UPSTASH_CLEAR_ON_LOGGED_OUT) {  
+            clearWhatsAppAuthInUpstash().catch(() => {});  
+          }  
   
-          setTimeout(startBot, 5000);  
-        } else {  
-          botStatus = 'reconnecting';  
-          setTimeout(startBot, code === 405 ? 15000 : 10000);  
+          setTimeout(() => startBot().catch(() => {}), 5000);  
+          return;  
         }  
+  
+        botStatus = 'reconnecting';  
+        setTimeout(() => startBot().catch(() => {}), code === 405 ? 15000 : 10000);  
       }  
   
       if (connection === 'open') {  
-        currentQR = null;  
         botStatus = 'connected';  
-        console.log('✅ WhatsApp Connected! Mega Agency LIVE!');  
+        currentQR = null;  
+        console.log('✅ WhatsApp Connected! Mega Agency LIVE');  
   
-        setTimeout(processChatsFromStore, 5000);  
-        await initSheet().catch(() => {});  
+        initSheet().catch(() => {});  
       }  
     });  
-  
-    sock.ev.on('chats.upsert', () => processChatsFromStore());  
-    sock.ev.on('chats.set', () => setTimeout(processChatsFromStore, 2000));  
   
     sock.ev.on('messages.upsert', async ({ messages, type }) => {  
       if (type !== 'notify') return;  
+  
       for (const msg of messages) {  
-        await handleMessage(sock, msg);  
+        if (!msg?.key?.remoteJid) continue;  
+        if (msg.key.fromMe) continue;  
+  
+        const senderId = msg.key.remoteJid;  
+  
+        if (senderId === 'status@broadcast') continue;  
+        if (senderId.endsWith('@g.us')) continue;  
+        if (senderId.endsWith('@broadcast')) continue;  
+        if (senderId.includes('newsletter')) continue;  
+  
+        const senderName = msg.pushName || 'Customer';  
+        const msgType = Object.keys(msg.message || {})[0];  
+  
+        enqueueForJid(senderId, async () => {  
+          try {  
+            if (msgType === 'audioMessage' || msgType === 'pttMessage') {  
+              await handleVoiceMessage(sock, msg, senderId, senderName);  
+              return;  
+            }  
+  
+            if (msgType === 'imageMessage') {  
+              await handleImageMessage(sock, msg, senderId, senderName);  
+              return;  
+            }  
+  
+            // default: treat as text if conversation/extendedText exists  
+            await handleTextMessage(sock, msg, senderId, senderName);  
+          } catch (e) {  
+            console.error('Handle message error:', e?.message || e);  
+          }  
+        });  
       }  
     });  
+  
+    return;  
   } catch (err) {  
-    console.error('Bot error:', err?.message || err);  
-    setTimeout(startBot, 15000);  
+    console.error('Bot start error:', err?.message || err);  
+    botStatus = 'error';  
+    setTimeout(() => startBot().catch(() => {}), 15000);  
   }  
 }  
   
-// ─────────────────────────────────────────// SERVER + DASHBOARD // ─────────────────────────────────────────  
+/* ─────────────────────────────  
+   DASHBOARD HTML (MINIMAL + SAFE)  
+───────────────────────────── */  
+function loginHtml(businessName) {  
+  return (  
+    '<!doctype html>' +  
+    '<html><head><meta name="viewport" content="width=device-width,initial-scale=1"/>' +  
+    '<style>' +  
+    'body{background:#0f0f0f;color:#fff;font-family:Segoe UI,Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;}' +  
+    '.box{background:#1a1a1a;padding:28px;border-radius:14px;width:92%;max-width:420px;border:1px solid #333;text-align:center;}' +  
+    'h1{color:#25D366;font-size:20px;margin:0 0 8px;}' +  
+    'p{color:#aaa;font-size:13px;margin:0 0 18px;}' +  
+    'input{width:100%;padding:12px 14px;background:#0f0f0f;border:1px solid #333;border-radius:10px;color:#fff;font-size:15px;outline:none;}' +  
+    'input:focus{border-color:#25D366;}' +  
+    'button{width:100%;margin-top:12px;padding:12px 14px;background:#25D366;border:none;border-radius:10px;color:#000;font-size:16px;font-weight:800;cursor:pointer;}' +  
+    'button:hover{background:#1ebe57;}' +  
+    '.err{color:#e74c3c;font-size:13px;margin-top:10px;display:none;}' +  
+    '</style></head><body>' +  
+    '<div class="box">' +  
+    '<h1>🏪 ' +  
+    (businessName || 'Mega Agency') +  
+    '</h1>' +  
+    '<p>Admin Dashboard Login</p>' +  
+    '<input type="password" id="pass" placeholder="Password"/>' +  
+    '<button onclick="login()">🔐 Login</button>' +  
+    '<div class="err" id="err">❌ Wrong password!</div>' +  
+    '</div>' +  
+    '<script>' +  
+    'async function login(){' +  
+    ' const r=await fetch("/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:document.getElementById("pass").value})});' +  
+    ' const d=await r.json();' +  
+    ' if(d.success){location="/dashboard";}else{document.getElementById("err").style.display="block";}' +  
+    '}' +  
+    '</script>' +  
+    '</body></html>'  
+  );  
+}  
+  
 function dashboardHtml() {  
   const biz = botData?.settings?.businessName || 'Mega Agency';  
   
-  return `<!doctype html>  
-<html>  
-<head>  
-<meta charset="utf-8"/>  
-<meta name="viewport" content="width=device-width,initial-scale=1"/>  
-<title>${biz} - Admin</title>  
-<style>  
-  body{background:#0a0a0a;color:#e0e0e0;font-family:Arial,sans-serif;margin:0;padding:0}  
-  .wrap{max-width:1100px;margin:0 auto;padding:16px}  
-  h1{margin:0 0 10px;color:#25D366;font-size:20px}  
-  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}  
-  .card{background:#111;border:1px solid #222;border-radius:12px;padding:16px;margin:12px 0}  
-  .badge{padding:4px 10px;border-radius:999px;font-size:12px;font-weight:bold;border:1px solid #333}  
-  .badge.live{color:#25D366;border-color:#25D366}  
-  .badge.off{color:#e74c3c;border-color:#e74c3c}  
-  button{background:#25D366;color:black;border:none;border-radius:10px;padding:10px 14px;font-weight:bold;cursor:pointer}  
-  button.gray{background:#333;color:white}  
-  button.red{background:#e74c3c;color:white}  
-  button.blue{background:#3498db;color:white}  
-  input,textarea,select{width:100%;background:#0f0f0f;border:1px solid #333;border-radius:8px;color:white;padding:10px;margin-top:6px;box-sizing:border-box}  
-  textarea{min-height:140px}  
-  label{color:#aaa;font-size:13px}  
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}  
-  .order{border:1px solid #222;background:#0f0f0f;border-radius:10px;padding:12px;margin:10px 0}  
-  .order .top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}  
-  .meta{color:#aaa;font-size:13px;line-height:1.6;margin-top:6px;white-space:pre-wrap}  
-  .chats{max-height:260px;overflow:auto;border:1px solid #222;border-radius:10px;padding:10px;background:#0f0f0f}  
-  .chatItem{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px;border-radius:8px}  
-  .chatItem:hover{background:#161616}  
-  .toast{position:fixed;bottom:16px;right:16px;background:#25D366;color:black;padding:12px 16px;border-radius:10px;font-weight:bold;display:none;z-index:999}  
-  .muted{color:#888}  
-  hr{border:none;border-top:1px solid #222;margin:14px 0}  
-</style>  
-</head>  
-<body>  
-<div class="wrap">  
-  <h1>🏪 ${biz} Admin Panel</h1>  
+  return (  
+    '<!doctype html>' +  
+    '<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>' +  
+    '<title>' + biz + ' - Admin</title>' +  
+    '<style>' +  
+    '*{box-sizing:border-box}body{margin:0;background:#0a0a0a;color:#e0e0e0;font-family:Segoe UI,Arial,sans-serif;}' +  
+    '.wrap{max-width:1200px;margin:0 auto;padding:18px;}' +  
+    '.top{display:flex;gap:12px;flex-wrap:wrap;align-items:center;justify-content:space-between;margin-bottom:12px;}' +  
+    '.badge{padding:6px 12px;border-radius:999px;border:1px solid #333;font-weight:800;font-size:12px;}' +  
+    '.live{background:#0d2b0d;color:#25D366;border-color:#25D366;}' +  
+    '.off{background:#2b0d0d;color:#e74c3c;border-color:#e74c3c;}' +  
+    '.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;}' +  
+    '.card{background:#111;border:1px solid #222;border-radius:12px;padding:14px;}' +  
+    'h2{margin:0 0 10px;font-size:15px;}' +  
+    'textarea{width:100%;min-height:160px;background:#0f0f0f;border:1px solid #333;border-radius:10px;color:#fff;padding:12px;outline:none;}' +  
+    'input{width:100%;padding:10px 12px;background:#0f0f0f;border:1px solid #333;border-radius:10px;color:#fff;outline:none;}' +  
+    'label{display:block;color:#aaa;font-size:12px;margin-top:10px;margin-bottom:6px;}' +  
+    'button{background:#25D366;color:#000;border:none;border-radius:10px;padding:10px 14px;font-weight:900;cursor:pointer;}' +  
+    'button.gray{background:#333;color:#fff}' +  
+    'button.red{background:#e74c3c;color:#fff}' +  
+    'button.blue{background:#3498db;color:#fff}' +  
+    '.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}' +  
+    '.muted{color:#aaa;font-size:13px}' +  
+    '.order{border:1px solid #222;background:#0f0f0f;border-radius:10px;padding:10px;margin-top:10px;}' +  
+    '.orderTop{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;}' +  
+    '.small{font-size:12px;color:#aaa;margin-top:6px;line-height:1.5;white-space:pre-wrap}' +  
+    '.toast{position:fixed;right:16px;bottom:16px;background:#25D366;color:#000;padding:12px 16px;border-radius:10px;font-weight:900;display:none;z-index:999}' +  
+    'hr{border:none;border-top:1px solid #222;margin:14px 0}' +  
+    '.ordersWrap{display:flex;gap:14px;flex-wrap:wrap}' +  
+    '.ordersCol{flex:1;min-width:320px}' +  
+    '</style></head>' +  
+    '<body><div class="wrap">' +  
+    '<div class="top">' +  
+    '<div>' +  
+    '<div style="font-weight:1000;font-size:18px;color:#25D366;margin-bottom:2px;">' + biz + ' Admin</div>' +  
+    '<div class="muted" id="sub">Loading...</div>' +  
+    '</div>' +  
+    '<div class="row">' +  
+    '<div class="badge off" id="botBadge">Bot: ...</div>' +  
+    '<button class="gray" onclick="loadData()">🔄 reload</button>' +  
+    '</div>' +  
+    '</div>' +  
   
-  <div class="row">  
-    <span id="botBadge" class="badge off">Loading...</span>  
-    <div id="statsLine" class="muted"></div>  
-    <button class="gray" id="btnReload">🔄 reload</button>  
-  </div>  
+    '<div class="ordersWrap">' +  
+    '<div class="ordersCol card"><h2>📦 Orders</h2><div class="muted">Pending</div><div id="pending"></div><hr/><div class="muted">Approved</div><div id="approved"></div><hr/><div class="muted">Rejected</div><div id="rejected"></div></div>' +  
+    '</div>' +  
   
-  <div class="card">  
-    <h2 style="margin:0 0 10px">📦 Orders</h2>  
-    <div class="grid">  
-      <div><h3>Pending</h3><div id="pendingList"></div></div>  
-      <div><h3>Approved</h3><div id="approvedList"></div></div>  
-      <div><h3>Rejected</h3><div id="rejectedList"></div></div>  
-    </div>  
-  </div>  
+    '<div class="grid" style="margin-top:14px;">' +  
+    '<div class="card"><h2>🤖 AI Prompt</h2>' +  
+    '<textarea id="aiPrompt"></textarea>' +  
+    '<div class="row" style="margin-top:12px;"><button onclick="savePrompt()">💾 Save Prompt</button></div>' +  
+    '</div>' +  
   
-  <div class="card">  
-    <h2 style="margin:0 0 10px">🤖 AI Prompt</h2>  
-    <textarea id="aiPrompt"></textarea>  
-    <div class="row" style="margin-top:10px"><button id="btnSavePrompt">💾 Save Prompt</button></div>  
-  </div>  
+    '<div class="card"><h2>⚙️ Settings</h2>' +  
+    '<label>Business Name</label><input id="s_bizName"/>' +  
+    '<label>Admin WhatsApp Number (e.g. 923001234567)</label><input id="s_adminNum"/>' +  
+    '<label>Dashboard Password (leave empty to keep)</label><input id="s_password" type="password"/>' +  
+    '<div class="row" style="margin-top:12px;"><button onclick="saveSettings()">💾 Save Settings</button></div>' +  
+    '</div>' +  
   
-  <div class="card">  
-    <h2 style="margin:0 0 10px">⚙️ Settings</h2>  
-    <div class="grid">  
-      <div>  
-        <label>Business Name</label>  
-        <input id="s_bizName" />  
-      </div>  
-      <div>  
-        <label>Admin WhatsApp Number</label>  
-        <input id="s_adminNum" placeholder="923001234567"/>  
-      </div>  
-    </div>  
-    <div>  
-      <label>Dashboard Password (leave empty to keep current)</label>  
-      <input id="s_password" type="password" placeholder="New password..."/>  
-    </div>  
-    <div class="row" style="margin-top:10px"><button id="btnSaveSettings">💾 Save Settings</button></div>  
-  </div>  
+    '<div class="card"><h2>💳 Payment</h2>' +  
+    '<label>EasyPaisa Number</label><input id="ep_number"/>' +  
+    '<label>EasyPaisa Name</label><input id="ep_name"/>' +  
+    '<label>JazzCash Number</label><input id="jc_number"/>' +  
+    '<label>JazzCash Name</label><input id="jc_name"/>' +  
+    '<label>Bank Name</label><input id="bank_name"/>' +  
+    '<label>Account Number</label><input id="bank_acc"/>' +  
+    '<label>Account Holder Name</label><input id="bank_holder"/>' +  
+    '<label>IBAN</label><input id="bank_iban"/>' +  
+    '<div class="row" style="margin-top:12px;"><button onclick="savePayment()">💾 Save Payment</button></div>' +  
+    '</div>' +  
   
-  <div class="card">  
-    <h2 style="margin:0 0 10px">💳 Payment Details</h2>  
-    <div class="grid">  
-      <div>  
-        <h3>EasyPaisa</h3>  
-        <label>Number</label><input id="ep_number" placeholder="03XX-XXXXXXX"/>  
-        <label>Account Name</label><input id="ep_name" placeholder="Tumhara Naam"/>  
-      </div>  
-      <div>  
-        <h3>JazzCash</h3>  
-        <label>Number</label><input id="jc_number" placeholder="03XX-XXXXXXX"/>  
-        <label>Account Name</label><input id="jc_name" placeholder="Tumhara Naam"/>  
-      </div>  
-      <div>  
-        <h3>Bank</h3>  
-        <label>Bank Name</label><input id="bank_name" placeholder="HBL"/>  
-        <label>Account Number</label><input id="bank_acc" placeholder="XXXXXXXXXXXXXXX"/>  
-        <label>Account Holder Name</label><input id="bank_holder" placeholder="Tumhara Naam"/>  
-        <label>IBAN</label><input id="bank_iban" placeholder="PK00XXXX..."/>  
-      </div>  
-    </div>  
-    <div class="row" style="margin-top:10px"><button id="btnSavePayment">💾 Save Payment</button></div>  
-  </div>  
+    '<div class="card"><h2>🎨 Products (JSON Array)</h2>' +  
+    '<div class="muted" style="margin-bottom:10px;">Paste products array and keep fields: id,name,price,description,features,downloadLink,active</div>' +  
+    '<textarea id="productsJson"></textarea>' +  
+    '<div class="row" style="margin-top:12px;"><button onclick="saveProducts()">💾 Save Products</button></div>' +  
+    '</div>' +  
+    '</div>' +  
+    '</div>' +  
   
-  <div class="card">  
-    <h2 style="margin:0 0 10px">🎨 Products</h2>  
-    <div class="muted" style="margin-bottom:8px;font-size:13px">  
-      Paste products array JSON. Each product: {id,name,price,description,features,downloadLink,active}  
-    </div>  
-    <textarea id="productsJson" style="min-height:220px"></textarea>  
-    <div class="row" style="margin-top:10px"><button id="btnSaveProducts">💾 Save Products</button></div>  
-  </div>  
+    '<div class="toast" id="toast"></div>' +  
   
-  <div class="card">  
-    <h2 style="margin:0 0 10px">📢 Broadcast (AI message)</h2>  
-  
-    <label>Offer Details for AI</label>  
-    <textarea id="offerDetails" style="min-height:90px"></textarea>  
-  
-    <div class="row" style="margin-top:6px">  
-      <div style="flex:1;min-width:220px">  
-        <label>Message Type</label>  
-        <select id="msgType">  
-          <option value="personalized">Personalized (name)</option>  
-          <option value="same">Same message</option>  
-        </select>  
-      </div>  
-      <div style="flex:0 0 auto">  
-        <button id="btnGenerate">🤖 Generate</button>  
-      </div>  
-    </div>  
-  
-    <div id="generatedWrap" style="display:none;margin-top:12px">  
-      <label>Generated Message (editable)</label>  
-      <textarea id="msgPreview" style="min-height:120px"></textarea>  
-    </div>  
-  
-    <hr/>  
-  
-    <div class="row">  
-      <div style="flex:1">  
-        <label>Search contacts</label>  
-        <input id="chatSearch" placeholder="🔍 Search..." />  
-      </div>  
-      <div style="flex:0 0 auto;align-self:flex-end">  
-        <button class="gray" id="btnLoadChats">Load Chats</button>  
-      </div>  
-    </div>  
-  
-    <div class="chats" id="chatsList" style="margin-top:12px"></div>  
-  
-    <div class="row" style="margin-top:10px">  
-      <div style="flex:0 0 220px">  
-        <label>Delay between messages (sec)</label>  
-        <input id="bc_delay" type="number" value="5" min="1" max="60"/>  
-      </div>  
-      <div style="flex:1">  
-        <button id="btnBroadcast" style="width:100%">📨 Send Broadcast</button>  
-      </div>  
-    </div>  
-  
-  </div>  
-</div>  
-  
-<div class="toast" id="toast"></div>  
-  
-<script>  
-let allData = null;  
-let allChats = [];  
-let selectedChats = new Set();  
-  
-function $(id){ return document.getElementById(id); }  
-function toast(msg){ const el = $('toast'); el.textContent = msg; el.style.display='block'; setTimeout(()=>el.style.display='none',2500); }  
-  
-async function api(path, opts){  
-  const res = await fetch(path, opts);  
-  const ct = (res.headers.get('content-type')||'');  
-  if(ct.includes('application/json')) return res.json();  
-  return res.text();  
+    '<script>' +  
+    'let allData=null;' +  
+    'function $(id){return document.getElementById(id)}' +  
+    'function toast(msg){const t=$(\"toast\");t.textContent=msg;t.style.display=\"block\";setTimeout(()=>t.style.display=\"none\",2500)}' +  
+    'function setBadge(status){const b=$(\"botBadge\"); if(status===\"connected\"){b.className=\"badge live\";b.textContent=\"Bot: connected\";}else{b.className=\"badge off\";b.textContent=\"Bot: \"+status;}}' +  
+    'function orderCard(o){' +  
+    '  const time=o.timestamp?new Date(o.timestamp).toLocaleString(\"en-PK\"):\"\";' +  
+    '  const shot=o.hasScreenshot?\"✅ Received\":\"❌ Pending\";' +  
+    '  const lang=o.language||\"\";' +  
+    '  if(o.status===\"pending\"){' +  
+    '    return ' +  
+    '      \"<div class=\\\"order\\\">\"+' +  
+    '      \"<div class=\\\"orderTop\\\">\"+' +  
+    '        \"<div><b>#\"+o.orderId+\"</b>\"+ (lang?\" <span class=\\\"muted\\\">(\"+lang+\")</span>\":\"\") +\"<div class=\\\"small\\\">\"+(o.customerName||\"\")+\" • \"+(o.customerNumber||\"\") +\"</div></div>\"+' +  
+    '        \"<div class=\\\"row\\\" style=\\\"justify-content:flex-end\\\">\"+' +  
+    '          \"<button class=\\\"blue\\\" style=\\\"margin-right:8px\\\" onclick=\\\"approve(\"+o.orderId+\")\\\">✅ Approve</button>\"+' +  
+    '          \"<button class=\\\"red\\\" onclick=\\\"reject(\"+o.orderId+\")\\\">❌ Reject</button>\"+' +  
+    '        \"</div>\"+' +  
+    '      \"</div>\"+' +  
+    '      \"<div class=\\\"small\\\">Product: <b>\"+(o.productName||\"\")+\"</b>\\nScreenshot: \"+shot+\"\\nTime: \"+time+\"</div>\"+' +  
+    '      \"</div>\";' +  
+    '  }' +  
+    '  if(o.status===\"approved\"){' +  
+    '    return ' +  
+    '      \"<div class=\\\"order\\\">\"+' +  
+    '      \"<div class=\\\"orderTop\\\">\"+' +  
+    '        \"<div><b>#\"+o.orderId+\"</b><div class=\\\"small\\\">\"+(o.customerName||\"\")+\" • \"+(o.customerNumber||\"\")+\"</div></div>\"+' +  
+    '        \"<div class=\\\"muted\\\">✅ Approved</div>\"+' +  
+    '      \"</div>\"+' +  
+    '      \"<div class=\\\"small\\\">Product: <b>\"+(o.productName||\"\")+\"</b>\\nScreenshot: \"+shot+\"\\nTime: \"+time+\"</div>\"+' +  
+    '      \"</div>\";' +  
+    '  }' +  
+    '  return ' +  
+    '    \"<div class=\\\"order\\\">\"+' +  
+    '    \"<div class=\\\"orderTop\\\">\"+' +  
+    '      \"<div><b>#\"+o.orderId+\"</b><div class=\\\"small\\\">\"+(o.customerName||\"\")+\" • \"+(o.customerNumber||\"\")+\"</div></div>\"+' +  
+    '      \"<div class=\\\"muted\\\">❌ Rejected</div>\"+' +  
+    '    \"</div>\"+' +  
+    '    \"<div class=\\\"small\\\">Product: <b>\"+(o.productName||\"\")+\"</b>\\nTime: \"+time+\"</div>\"+' +  
+    '    \"</div>\";' +  
+    '}' +  
+    'async function api(path,opts){const r=await fetch(path,opts); return r.json();}' +  
+    'async function loadData(){' +  
+    '  const d=await api(\"/api/data\");' +  
+    '  allData=d;' +  
+    '  $(\"sub\").textContent = \"Orders: \"+d.stats.total+\" • Pending: \"+d.stats.pending+\" • Approved: \"+d.stats.approved+\" • Rejected: \"+d.stats.rejected;' +  
+    '  setBadge(d.botStatus);' +  
+    '  $(\"aiPrompt\").value = d.aiPrompt || \"\";' +  
+    '  $(\"s_bizName\").value = d.settings?.businessName || \"\";' +  
+    '  $(\"s_adminNum\").value = d.settings?.adminNumber || \"\";' +  
+    '  $(\"s_password\").value = \"\";' +  
+    '  $(\"ep_number\").value = d.payment?.easypaisa?.number || \"\";' +  
+    '  $(\"ep_name\").value = d.payment?.easypaisa?.name || \"\";' +  
+    '  $(\"jc_number\").value = d.payment?.jazzcash?.number || \"\";' +  
+    '  $(\"jc_name\").value = d.payment?.jazzcash?.name || \"\";' +  
+    '  $(\"bank_name\").value = d.payment?.bank?.bankName || \"\";' +  
+    '  $(\"bank_acc\").value = d.payment?.bank?.accountNumber || \"\";' +  
+    '  $(\"bank_holder\").value = d.payment?.bank?.accountName || \"\";' +  
+    '  $(\"bank_iban\").value = d.payment?.bank?.iban || \"\";' +  
+    '  $(\"productsJson\").value = JSON.stringify(d.products || [], null, 2);' +  
+    '  const orders=(d.orders||[]);' +  
+    '  const pending=orders.filter(o=>o.status===\"pending\");' +  
+    '  const approved=orders.filter(o=>o.status===\"approved\");' +  
+    '  const rejected=orders.filter(o=>o.status===\"rejected\");' +  
+    '  $(\"pending\").innerHTML = pending.length ? pending.map(orderCard).join(\"\") : \"<div class=\\\"muted\\\">No pending order</div>\";' +  
+    '  $(\"approved\").innerHTML = approved.length ? approved.map(orderCard).join(\"\") : \"<div class=\\\"muted\\\">No approved order</div>\";' +  
+    '  $(\"rejected\").innerHTML = rejected.length ? rejected.map(orderCard).join(\"\") : \"<div class=\\\"muted\\\">No rejected order</div>\";' +  
+    '}' +  
+    'async function savePrompt(){' +  
+    '  await api(\"/api/prompt\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({prompt:$(\"aiPrompt\").value})});' +  
+    '  toast(\"✅ Prompt saved\");' +  
+    '}' +  
+    'async function saveSettings(){' +  
+    '  await api(\"/api/settings\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({' +  
+    '    businessName:$(\"s_bizName\").value,' +  
+    '    adminNumber:$(\"s_adminNum\").value,' +  
+    '    dashboardPassword:$(\"s_password\").value' +  
+    '  })});' +  
+    '  $(\"s_password\").value=\"\";' +  
+    '  toast(\"✅ Settings saved\");' +  
+    '  await loadData();' +  
+    '}' +  
+    'async function savePayment(){' +  
+    '  await api(\"/api/payment\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify({'+  
+    '    easypaisa:{number:$(\"ep_number\").value,name:$(\"ep_name\").value},' +  
+    '    jazzcash:{number:$(\"jc_number\").value,name:$(\"jc_name\").value},' +  
+    '    bank:{bankName:$(\"bank_name\").value,accountNumber:$(\"bank_acc\").value,accountName:$(\"bank_holder\").value,iban:$(\"bank_iban\").value}' +  
+    '  })});' +  
+    '  toast(\"✅ Payment saved\");' +  
+    '  await loadData();' +  
+    '}' +  
+    'async function saveProducts(){' +  
+    '  let arr=null;' +  
+    '  try{ arr=JSON.parse($(\"productsJson\").value||\"[]\"); }catch(e){ toast(\"Products JSON invalid\"); return; }' +  
+    '  if(!Array.isArray(arr)){ toast(\"Products must be array\"); return; }' +  
+    '  await api(\"/api/products\",{method:\"POST\",headers:{\"Content-Type\":\"application/json\"},body:JSON.stringify(arr)});' +  
+    '  toast(\"✅ Products saved\");' +  
+    '  await loadData();' +  
+    '}' +  
+    'async function approve(orderId){' +  
+    '  if(!confirm(\"Approve order #\"+orderId+\"?\")) return;' +  
+    '  await api(\"/api/approve/\"+orderId,{method:\"POST\"});' +  
+    '  toast(\"✅ Approved\");' +  
+    '  await loadData();' +  
+    '}' +  
+    'async function reject(orderId){' +  
+    '  if(!confirm(\"Reject order #\"+orderId+\"?\")) return;' +  
+    '  await api(\"/api/reject/\"+orderId,{method:\"POST\"});' +  
+    '  toast(\"❌ Rejected\");' +  
+    '  await loadData();' +  
+    '}' +  
+    'loadData().catch(()=>{ $(\"sub\").textContent=\"Failed to load. Check server.\"; });' +  
+    '</script>' +  
+    '</body></html>'  
+  );  
 }  
   
-async function loadData(){  
-  allData = await api('/api/data');  
-  render();  
+/* ─────────────────────────────  
+   SERVER AUTH + ROUTES  
+───────────────────────────── */  
+const sessions = {};  
+  
+function isAuthenticated(req) {  
+  const cookies = req.headers.cookie || '';  
+  const sessionMatch = cookies.match(/session=([^;]+)/);  
+  if (!sessionMatch) return false;  
+  return sessions[sessionMatch[1]] === true;  
 }  
   
-function orderCard(o){  
-  const hasShot = o.hasScreenshot ? '✅ Received' : '❌ Pending';  
-  const time = o.timestamp ? new Date(o.timestamp).toLocaleString('en-PK') : '';  
-  const badge = o.language ? '<span class="badge" style="border-color:#333;color:#aaa;background:#0f0f0f;margin-left:8px">'+o.language+'</span>' : '';  
-  if(o.status === 'pending'){  
-    return \`  
-      <div class="order">  
-        <div class="top">  
-          <div>  
-            <b>#\${o.orderId}</b>\${badge}  
-            <div class="muted" style="font-size:12px;margin-top:4px">\${o.status}</div>  
-          </div>  
-          <div class="row" style="gap:8px;justify-content:flex-end">  
-            <button class="blue" style="padding:8px 12px" onclick="approve(\${o.orderId})">✅ Approve</button>  
-            <button class="red" style="padding:8px 12px" onclick="reject(\${o.orderId})">❌ Reject</button>  
-          </div>  
-        </div>  
-        <div class="meta">  
-          📱 \${o.customerNumber||''}  
-          👤 \${o.customerName||''}  
-          📸 \${hasShot}  
-          🕒 \${time}  
-        </div>  
-      </div>  
-    \`;  
-  }  
-  return \`  
-    <div class="order">  
-      <div class="top">  
-        <div>  
-          <b>#\${o.orderId}</b>\${badge}  
-          <div class="muted" style="font-size:12px;margin-top:4px">\${o.status}</div>  
-        </div>  
-      </div>  
-      <div class="meta">  
-        📱 \${o.customerNumber||''}  
-        👤 \${o.customerName||''}  
-        📸 \${hasShot}  
-        🕒 \${time}  
-      </div>  
-    </div>  
-  \`;  
-}  
-  
-function render(){  
-  const s = allData.stats || {};  
-  $('botBadge').className = 'badge ' + (allData.botStatus === 'connected' ? 'live' : 'off');  
-  $('botBadge').textContent = allData.botStatus === 'connected' ? 'Bot Live' : allData.botStatus;  
-  $('statsLine').textContent = \`Pending: \${s.pending||0} | Approved: \${s.approved||0} | Rejected: \${s.rejected||0}\`;  
-  
-  const orders = Object.values(allData.orders||{}).sort((a,b)=> (b.timestamp||0)-(a.timestamp||0));  
-  const pending = orders.filter(o=>o.status==='pending');  
-  const approved = orders.filter(o=>o.status==='approved');  
-  const rejected = orders.filter(o=>o.status==='rejected');  
-  
-  $('pendingList').innerHTML = pending.length ? pending.map(orderCard).join('') : '<div class="muted">No pending orders</div>';  
-  $('approvedList').innerHTML = approved.length ? approved.map(orderCard).join('') : '<div class="muted">No approved orders</div>';  
-  $('rejectedList').innerHTML = rejected.length ? rejected.map(orderCard).join('') : '<div class="muted">No rejected orders</div>';  
-  
-  $('aiPrompt').value = allData.aiPrompt || '';  
-  $('s_bizName').value = allData.settings?.businessName || '';  
-  $('s_adminNum').value = allData.settings?.adminNumber || '';  
-  
-  $('ep_number').value = allData.payment?.easypaisa?.number || '';  
-  $('ep_name').value = allData.payment?.easypaisa?.name || '';  
-  $('jc_number').value = allData.payment?.jazzcash?.number || '';  
-  $('jc_name').value = allData.payment?.jazzcash?.name || '';  
-  
-  $('bank_name').value = allData.payment?.bank?.bankName || '';  
-  $('bank_acc').value = allData.payment?.bank?.accountNumber || '';  
-  $('bank_holder').value = allData.payment?.bank?.accountName || '';  
-  $('bank_iban').value = allData.payment?.bank?.iban || '';  
-  
-  $('productsJson').value = JSON.stringify(allData.products || [], null, 2);  
-}  
-  
-async function approve(orderId){  
-  if(!confirm('Approve order #'+orderId+'?')) return;  
-  await api('/api/approve/'+orderId,{ method:'POST' });  
-  toast('Approved ✅');  
-  await loadData();  
-}  
-async function reject(orderId){  
-  if(!confirm('Reject order #'+orderId+'?')) return;  
-  await api('/api/reject/'+orderId,{ method:'POST' });  
-  toast('Rejected ❌');  
-  await loadData();  
-}  
-  
-// Save handlers  
-$('btnSavePrompt').onclick = async () => {  
-  await api('/api/prompt',{  
-    method:'POST',  
-    headers:{'Content-Type':'application/json'},  
-    body: JSON.stringify({ prompt: $('aiPrompt').value })  
-  });  
-  toast('Prompt saved ✅');  
-};  
-  
-$('btnSaveSettings').onclick = async () => {  
-  const pw = $('s_password').value;  
-  const payload = {  
-    businessName: $('s_bizName').value,  
-    adminNumber: $('s_adminNum').value,  
-    dashboardPassword: pw || allData.settings?.dashboardPassword  
-  };  
-  await api('/api/settings',{  
-    method:'POST',  
-    headers:{'Content-Type':'application/json'},  
-    body: JSON.stringify(payload)  
-  });  
-  $('s_password').value='';  
-  toast('Settings saved ✅');  
-  await loadData();  
-};  
-  
-$('btnSavePayment').onclick = async () => {  
-  const payload = {  
-    easypaisa:{ number:$('ep_number').value, name:$('ep_name').value },  
-    jazzcash:{ number:$('jc_number').value, name:$('jc_name').value },  
-    bank:{  
-      bankName:$('bank_name').value,  
-      accountNumber:$('bank_acc').value,  
-      accountName:$('bank_holder').value,  
-      iban:$('bank_iban').value  
-    }  
-  };  
-  await api('/api/payment',{  
-    method:'POST',  
-    headers:{'Content-Type':'application/json'},  
-    body: JSON.stringify(payload)  
-  });  
-  toast('Payment saved ✅');  
-  await loadData();  
-};  
-  
-$('btnSaveProducts').onclick = async () => {  
-  let parsed;  
-  try{  
-    parsed = JSON.parse($('productsJson').value || '[]');  
-    if(!Array.isArray(parsed)) throw new Error('products must be array');  
-  }catch(e){  
-    toast('Products JSON invalid: '+e.message);  
-    return;  
-  }  
-  await api('/api/products',{  
-    method:'POST',  
-    headers:{'Content-Type':'application/json'},  
-    body: JSON.stringify(parsed)  
-  });  
-  toast('Products saved ✅');  
-  await loadData();  
-};  
-  
-// Broadcast UI  
-async function loadChats(){  
-  const d = await api('/api/chats');  
-  allChats = d.chats || [];  
-  selectedChats = new Set();  
-  renderChats();  
-}  
-  
-function renderChats(){  
-  const q = ($('chatSearch').value || '').toLowerCase();  
-  const list = allChats.filter(c=>{  
-    return (c.name||'').toLowerCase().includes(q) || (c.number||'').includes(q);  
-  });  
-  $('chatsList').innerHTML = list.map(c=>{  
-    const checked = selectedChats.has(c.jid) ? 'checked' : '';  
-    return \`  
-      <div class="chatItem">  
-        <label style="cursor:pointer">  
-          <input type="checkbox" ${checked}  
-            onchange="toggleChat('\${c.jid}')"  
-          />  
-          <b>\${c.name||c.number}</b>  
-          <div class="muted" style="font-size:12px">\${c.number}</div>  
-        </label>  
-      </div>  
-    \`;  
-  }).join('') || '<div class="muted">No chats</div>';  
-}  
-  
-function toggleChat(jid){  
-  if(selectedChats.has(jid)) selectedChats.delete(jid);  
-  else selectedChats.add(jid);  
-  renderChats();  
-}  
-  
-$('btnLoadChats').onclick = async () => {  
-  if(allData?.botStatus !== 'connected'){  
-    toast('Bot connect pehle karo.');  
-    return;  
-  }  
-  await loadChats();  
-};  
-  
-$('chatSearch').addEventListener('input', ()=>renderChats());  
-  
-$('btnGenerate').onclick = async () => {  
-  const offerDetails = $('offerDetails').value || '';  
-  if(!offerDetails.trim()){ toast('Offer details likho'); return; }  
-  
-  const personalized = $('msgType').value === 'personalized';  
-  $('btnGenerate').disabled = true;  
-  try{  
-    const d = await api('/api/generate-message',{  
-      method:'POST',  
-      headers:{'Content-Type':'application/json'},  
-      body: JSON.stringify({ offerDetails, customerName:'Dost', personalized })  
-    });  
-    if(d.success){  
-      $('msgPreview').value = d.message || '';  
-      $('generatedWrap').style.display='block';  
-      toast('Message generated ✅');  
-    }else{  
-      toast('Generate failed');  
-    }  
-  }catch(e){  
-    toast('Error: '+e.message);  
-  }finally{  
-    $('btnGenerate').disabled = false;  
-  }  
-};  
-  
-$('btnBroadcast').onclick = async () => {  
-  if(allData?.botStatus !== 'connected'){ toast('Bot connect pehle karo'); return; }  
-  
-  const selected = allChats.filter(c=>selectedChats.has(c.jid)).map(c=>({  
-    jid: c.jid,  
-    name: c.name || c.number,  
-    number: c.number  
-  }));  
-  
-  if(selected.length === 0){ toast('Contacts select karo'); return; }  
-  const offerDetails = $('offerDetails').value || '';  
-  const baseMessage = $('msgPreview').value || '';  
-  if(!baseMessage.trim() && !offerDetails.trim()){ toast('Generate message ya offer details do'); return; }  
-  
-  const personalized = $('msgType').value === 'personalized';  
-  const delaySeconds = parseInt($('bc_delay').value || '5', 10) || 5;  
-  
-  if(!confirm('Send broadcast to '+selected.length+' contacts?')) return;  
-  
-  $('btnBroadcast').disabled = true;  
-  
-  try{  
-    await api('/api/smart-broadcast',{  
-      method:'POST',  
-      headers:{'Content-Type':'application/json'},  
-      body: JSON.stringify({  
-        offerDetails,  
-        baseMessage,  
-        personalized,  
-        delaySeconds,  
-        selectedContacts: selected  
-      })  
-    });  
-    toast('Broadcast started ✅');  
-    await loadData();  
-  }catch(e){  
-    toast('Broadcast error: '+e.message);  
-  }finally{  
-    $('btnBroadcast').disabled = false;  
-  }  
-};  
-  
-// Init  
-$('btnReload').onclick = () => loadData().then(loadChats).catch(()=>{});  
-loadData().catch(e=>toast('Load error: '+e.message));  
-  
-// Poll every 15s (light)  
-setInterval(()=>loadData().catch(()=>{}), 15000);  
-</script>  
-</body>  
-</html>`;  
-}  
-  
-// ─────────────────────────────────────────// Web server routes // ─────────────────────────────────────────  
-const server = http.createServer(async (req, res) => {  
-  const parsedUrl = url.parse(req.url, true);  
-  const pathname = parsedUrl.pathname;  
-  const method = req.method || 'GET';  
-  
-  // LOGIN  
-  if (pathname === '/login') {  
-    if (method === 'POST') {  
-      const body = await parseBody(req);  
-      if (body.password === botData.settings.dashboardPassword) {  
-        const sessionId = Math.random().toString(36).substring(2);  
-        sessions[sessionId] = true;  
-        res.writeHead(200, {  
-          'Set-Cookie': `session=${sessionId}; Path=/; HttpOnly`,  
-          'Content-Type': 'application/json'  
-        });  
-        res.end(JSON.stringify({ success: true }));  
-      } else {  
-        res.writeHead(401, { 'Content-Type': 'application/json' });  
-        res.end(JSON.stringify({ success: false, message: 'Wrong password!' }));  
-      }  
-      return;  
-    }  
-  
-    res.writeHead(200, { 'Content-Type': 'text/html' });  
-    res.end(`<!DOCTYPE html>  
-<html>  
-<head>  
-<title>Login</title>  
-<meta name="viewport" content="width=device-width,initial-scale=1"/>  
-<style>  
-*{margin:0;padding:0;box-sizing:border-box;}  
-body{background:#0f0f0f;color:white;font-family:Segoe UI,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;}  
-.box{background:#1a1a1a;padding:40px;border-radius:16px;width:90%;max-width:380px;border:1px solid #333;text-align:center;}  
-h1{color:#25D366;font-size:24px;margin-bottom:8px;}  
-p{color:#aaa;font-size:13px;margin-bottom:25px;}  
-input{width:100%;padding:12px 15px;background:#0f0f0f;border:1px solid #333;border-radius:8px;color:white;font-size:15px;margin-bottom:15px;outline:none;}  
-input:focus{border-color:#25D366;}  
-button{width:100%;padding:12px;background:#25D366;border:none;border-radius:8px;color:black;font-size:16px;font-weight:bold;cursor:pointer;}  
-button:hover{background:#1ebe57;}  
-.err{color:#e74c3c;font-size:13px;margin-top:10px;display:none;}  
-</style>  
-</head>  
-<body>  
-<div class="box">  
-  <h1>🏪 ${botData.settings.businessName}</h1>  
-  <p>Admin Dashboard Login</p>  
-  <input type="password" id="pass" placeholder="Password" onkeypress="if(event.key==='Enter')login()"/>  
-  <button onclick="login()">🔐 Login</button>  
-  <div class="err" id="err">❌ Wrong password!</div>  
-</div>  
-<script>  
-async function login(){  
-  const r=await fetch('/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:document.getElementById('pass').value})});  
-  const d=await r.json();  
-  if(d.success) window.location='/dashboard';  
-  else document.getElementById('err').style.display='block';  
-}  
-</script>  
-</body>  
-</html>`);  
-    return;  
-  }  
-  
-  // AUTH CHECK (except /login and /qr)  
-  if (pathname !== '/qr' && pathname !== '/login' && !isAuthenticated(req)) {  
-    res.writeHead(302, { Location: '/login' });  
-    res.end();  
-    return;  
-  }  
-  
-  // QR PAGE  
-  if (pathname === '/qr') {  
-    res.writeHead(200, { 'Content-Type': 'text/html' });  
-  
-    if (botStatus === 'connected') {  
-      res.end(`<!doctype html>  
-<html><head><style>  
-body{background:#111;color:white;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;text-align:center;}  
-h2{color:#25D366;}a{color:#25D366;font-size:18px;margin-top:20px;text-decoration:none;}  
-p{color:#aaa;}  
-</style></head><body>  
-<h2>✅ Bot Connected!</h2><p>Mega Agency Bot live hai!</p>  
-<a href="/dashboard">📊 Dashboard Kholo</a>  
-</body></html>`);  
-      return;  
-    }  
-  
-    if (!currentQR) {  
-      res.end(`<!doctype html><html><head><meta http-equiv="refresh" content="3"/>  
-<style>  
-body{background:#111;color:white;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;text-align:center;}  
-h2{color:#f39c12;}p{color:#aaa;}  
-</style></head><body>  
-<h2>⏳ QR Generate Ho Raha Hai...</h2><p>Status: ${botStatus}</p></body></html>`);  
-      return;  
-    }  
-  
-    try {  
-      const qrDataURL = await QRCode.toDataURL(currentQR, { width: 300, margin: 2 });  
-      res.end(`<!doctype html><html><head>  
-<meta http-equiv="refresh" content="25"/>  
-<style>  
-body{background:#111;color:white;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;font-family:sans-serif;text-align:center;padding:20px;}  
-img{border:8px solid white;border-radius:12px;width:280px;height:280px;}  
-h2{color:#25D366;}  
-p{color:#aaa;}  
-</style></head><body>  
-<h2>📱 WhatsApp QR Code</h2>  
-<img src="${qrDataURL}"/>  
-<p style="color:#f39c12;margin-top:15px">⚠️ 25 sec mein expire!</p>  
-<p>Mega Agency bot live karne ke liye scan karo.</p>  
-</body></html>`);  
-    } catch (e) {  
-      res.end(`<h1 style="color:red">QR Error: ${e.message}</h1>`);  
-    }  
-    return;  
-  }  
-  
-  // DASHBOARD  
-  if (pathname === '/dashboard' || pathname === '/') {  
-    res.writeHead(200, { 'Content-Type': 'text/html' });  
-    res.end(dashboardHtml());  
-    return;  
-  }  
-  
-  // API: GET DATA  
-  if (pathname === '/api/data' && method === 'GET') {  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-  
-    const ordersArr = Object.values(botData.orders || {});  
-    const revenue = ordersArr  
-      .filter((o) => o.status === 'approved')  
-      .reduce((sum, o) => {  
-        const pr = botData.products.find((p) => p.id === o.productId) || botData.products[0];  
-        return sum + (pr?.price || 0);  
-      }, 0);  
-  
-    res.end(  
-      JSON.stringify({  
-        ...botData,  
-        botStatus,  
-        chatsLoaded,  
-        stats: {  
-          pending: ordersArr.filter((o) => o.status === 'pending').length,  
-          approved: ordersArr.filter((o) => o.status === 'approved').length,  
-          rejected: ordersArr.filter((o) => o.status === 'rejected').length,  
-          total: ordersArr.length,  
-          customers: Object.keys(botData.customers || {}).length,  
-          existingChats: existingChats.length,  
-          revenue  
-        }  
-      })  
-    );  
-    return;  
-  }  
-  
-  // API: GET CHATS  
-  if (pathname === '/api/chats' && method === 'GET') {  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-    res.end(  
-      JSON.stringify({  
-        chats: existingChats,  
-        loaded: chatsLoaded,  
-        count: existingChats.length  
-      })  
-    );  
-    return;  
-  }  
-  
-  // API: GENERATE MESSAGE  
-  if (pathname === '/api/generate-message' && method === 'POST') {  
-    const body = await parseBody(req);  
-    try {  
-      const msg = await generateBroadcastMessage(  
-        body.offerDetails || '',  
-        body.customerName || 'Dost',  
-        body.personalized || false  
-      );  
-      res.writeHead(200, { 'Content-Type': 'application/json' });  
-      res.end(JSON.stringify({ success: true, message: msg }));  
-    } catch (e) {  
-      res.writeHead(500, { 'Content-Type': 'application/json' });  
-      res.end(JSON.stringify({ success: false, error: e.message }));  
-    }  
-    return;  
-  }  
-  
-  // API: SMART BROADCAST  
-  if (pathname === '/api/smart-broadcast' && method === 'POST') {  
-    const body = await parseBody(req);  
-  
-    if (!body.selectedContacts || body.selectedContacts.length === 0) {  
-      res.writeHead(400, { 'Content-Type': 'application/json' });  
-      res.end(JSON.stringify({ success: false, error: 'Contacts select karo!' }));  
-      return;  
-    }  
-  
-    const bc = {  
-      id: Date.now(),  
-      offerDetails: body.offerDetails || '',  
-      baseMessage: body.baseMessage || '',  
-      personalized: body.personalized || false,  
-      delaySeconds: body.delaySeconds || 5,  
-      selectedContacts: body.selectedContacts,  
-      status: 'pending',  
-      sentCount: 0,  
-      failedCount: 0,  
-      totalContacts: body.selectedContacts.length,  
-      createdAt: Date.now()  
-    };  
-  
-    botData.broadcasts = botData.broadcasts || [];  
-    botData.broadcasts.unshift(bc);  
-    if (botData.broadcasts.length > 20) botData.broadcasts = botData.broadcasts.slice(0, 20);  
-  
-    await saveData();  
-  
-    if (!broadcastRunning) runBroadcast(bc).catch(console.error);  
-  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-    res.end(JSON.stringify({ success: true, broadcast: bc }));  
-    return;  
-  }  
-  
-  // API: SETTINGS  
-  if (pathname === '/api/settings' && method === 'POST') {  
-    const b = await parseBody(req);  
-    botData.settings = { ...botData.settings, ...b };  
-    await saveData();  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-    res.end(JSON.stringify({ success: true }));  
-    return;  
-  }  
-  
-  // API: PAYMENT  
-  if (pathname === '/api/payment' && method === 'POST') {  
-    const b = await parseBody(req);  
-    botData.payment = b;  
-    await saveData();  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-    res.end(JSON.stringify({ success: true }));  
-    return;  
-  }  
-  
-  // API: PRODUCTS  
-  if (pathname === '/api/products' && method === 'POST') {  
-    const b = await parseBody(req);  
-    botData.products = b;  
-    await saveData();  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-    res.end(JSON.stringify({ success: true }));  
-    return;  
-  }  
-  
-  // API: PROMPT  
-  if (pathname === '/api/prompt' && method === 'POST') {  
-    const b = await parseBody(req);  
-    botData.aiPrompt = b.prompt;  
-    await saveData();  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-    res.end(JSON.stringify({ success: true }));  
-    return;  
-  }  
-  
-  // API: APPROVE ORDER  
-  if (pathname.startsWith('/api/approve/') && method === 'POST') {  
-    const orderId = parseInt(pathname.split('/api/approve/')[1], 10);  
-    const order = Object.values(botData.orders || {}).find((o) => o.orderId === orderId);  
-  
-    if (order && sockGlobal) {  
-      order.status = 'approved';  
-      await saveData();  
-  
-      const product =  
-        botData.products.find((p) => p.id === order.productId) || botData.products[0];  
-  
+function parseBody(req) {  
+  return new Promise((resolve) => {  
+    let body = '';  
+    req.on('data', (chunk) => (body += chunk.toString()));  
+    req.on('end', () => {  
       try {  
-        const aiMsg = await getPaymentApprovedMessageAI({  
-          userId: order.customerJid,  
-          customerName: order.customerName || 'Customer',  
-          lang: order.language || 'roman_urdu',  
-          order,  
-          product  
-        });  
-  
-        await sockGlobal.sendMessage(order.customerJid, { text: aiMsg });  
-  
-        await saveToSheet({  
-          ...order,  
-          product: product.name,  
-          amount: product.price,  
-          status: 'approved'  
-        });  
-      } catch (e) {  
-        console.log('Approve err:', e.message);  
-      }  
-    }  
-  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-    res.end(JSON.stringify({ success: true }));  
-    return;  
-  }  
-  
-  // API: REJECT ORDER  
-  if (pathname.startsWith('/api/reject/') && method === 'POST') {  
-    const orderId = parseInt(pathname.split('/api/reject/')[1], 10);  
-    const order = Object.values(botData.orders || {}).find((o) => o.orderId === orderId);  
-  
-    if (order && sockGlobal) {  
-      order.status = 'rejected';  
-      await saveData();  
-  
-      try {  
-        const aiMsg = await getPaymentRejectedMessageAI({  
-          userId: order.customerJid,  
-          customerName: order.customerName || 'Customer',  
-          lang: order.language || 'roman_urdu',  
-          order  
-        });  
-  
-        await sockGlobal.sendMessage(order.customerJid, { text: aiMsg });  
-  
-        await saveToSheet({  
-          ...order,  
-          status: 'rejected'  
-        });  
+        resolve(JSON.parse(body || '{}'));  
       } catch {  
-        // ignore  
+        resolve({});  
       }  
-    }  
-  
-    res.writeHead(200, { 'Content-Type': 'application/json' });  
-    res.end(JSON.stringify({ success: true }));  
-    return;  
-  }  
-  
-  // API: SEND CUSTOM MESSAGE  
-  if (pathname === '/api/send-message' && method === 'POST') {  
-    const b = await parseBody(req);  
-    if (sockGlobal && b.jid && b.message) {  
-      try {  
-        await sockGlobal.sendMessage(b.jid, { text: b.message });  
-        res.writeHead(200, { 'Content-Type': 'application/json' });  
-        res.end(JSON.stringify({ success: true }));  
-      } catch (e) {  
-        res.writeHead(500, { 'Content-Type': 'application/json' });  
-        res.end(JSON.stringify({ success: false, error: e.message }));  
-      }  
-    } else {  
-      res.writeHead(400, { 'Content-Type': 'application/json' });  
-      res.end(JSON.stringify({ success: false }));  
-    }  
-    return;  
-  }  
-  
-  // LOGOUT  
-  if (pathname === '/logout') {  
-    res.writeHead(302, {  
-      'Set-Cookie': 'session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT',  
-      Location: '/login'  
     });  
-    res.end();  
-    return;  
-  }  
+  });  
+}  
   
-  res.writeHead(404, { 'Content-Type': 'application/json' });  
-  res.end(JSON.stringify({ error: 'Not found' }));  
+async function screenshotReceivedAI(order, customerName) {  
+  const lang = order.language || 'roman_urdu';  
+  const fallback = getScreenshotReceivedStatic(order.orderId, lang);  
+  
+  const scenarioDetails =  
+    `Customer ne payment screenshot bhej diya hai.\n` +  
+    `Order: #${order.orderId}\n` +  
+    `Admin is verifying.\n` +  
+    `Delivery: within 1 hour.\n` +  
+    `Write customer message in ${lang}. Do NOT include payment numbers.`;  
+  
+  return getAIScenarioMessage({  
+    userId: order.customerJid,  
+    customerName,  
+    lang,  
+    scenarioName: 'PAYMENT_SCREENSHOT_RECEIVED',  
+    scenarioDetails,  
+    fallbackText: fallback  
+  });  
+}  
+  
+async function paymentApprovedAI(order, product, customerName) {  
+  const lang = order.language || 'roman_urdu';  
+  const fallback = getPaymentApprovedStatic(order, product, lang);  
+  
+  const downloadPart = product?.downloadLink ? `Download link exists.` : `No download link.`;  
+  const scenarioDetails =  
+    `Payment approved and order confirmed.\nOrder #${order.orderId}\nProduct: ${product?.name}\n${downloadPart}\n` +  
+    `If downloadLink exists, include it.\nKeep short (3-5 lines), emojis ok. Do NOT output ORDER_READY.`;  
+  
+  return getAIScenarioMessage({  
+    userId: order.customerJid,  
+    customerName,  
+    lang,  
+    scenarioName: 'PAYMENT_APPROVED',  
+    scenarioDetails,  
+    fallbackText: fallback  
+  });  
+}  
+  
+async function paymentRejectedAI(order, customerName) {  
+  const lang = order.language || 'roman_urdu';  
+  const fallback = getPaymentRejectedStatic(order, lang);  
+  
+  const scenarioDetails =  
+    `Payment verify failed.\nOrder #${order.orderId}\nApologize politely.\nAsk customer to resend correct screenshot or contact admin.\n` +  
+    `Also mention: type "buy" to retry.\nKeep short (3-5 lines), emojis ok. Do NOT output ORDER_READY.`;  
+  
+  return getAIScenarioMessage({  
+    userId: order.customerJid,  
+    customerName,  
+    lang,  
+    scenarioName: 'PAYMENT_REJECTED',  
+    scenarioDetails,  
+    fallbackText: fallback  
+  });  
+}  
+  
+const server = http.createServer(async (req, res) => {  
+  try {  
+    const parsed = url.parse(req.url, true);  
+    const pathname = parsed.pathname;  
+    const method = req.method || 'GET';  
+  
+    // Health check  
+    if (pathname === '/health') {  
+      res.writeHead(200, { 'Content-Type': 'application/json' });  
+      res.end(JSON.stringify({ ok: true, botStatus }));  
+      return;  
+    }  
+  
+    // Login page  
+    if (pathname === '/login') {  
+      if (method === 'POST') {  
+        const body = await parseBody(req);  
+        if (body.password === botData.settings.dashboardPassword) {  
+          const sessionId = Math.random().toString(36).substring(2);  
+          sessions[sessionId] = true;  
+          res.writeHead(200, {  
+            'Set-Cookie': `session=${sessionId}; Path=/; HttpOnly`,  
+            'Content-Type': 'application/json'  
+          });  
+          res.end(JSON.stringify({ success: true }));  
+        } else {  
+          res.writeHead(401, { 'Content-Type': 'application/json' });  
+          res.end(JSON.stringify({ success: false }));  
+        }  
+        return;  
+      }  
+  
+      res.writeHead(200, { 'Content-Type': 'text/html' });  
+      res.end(loginHtml(botData?.settings?.businessName));  
+      return;  
+    }  
+  
+    // QR page (no auth)  
+    if (pathname === '/qr') {  
+      res.writeHead(200, { 'Content-Type': 'text/html' });  
+  
+      if (botStatus === 'connected') {  
+        res.end('<!doctype html><html><body style="font-family:Segoe UI,Arial,sans-serif;background:#111;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;text-align:center;">' +  
+          '<h2 style="color:#25D366;margin:0 0 10px;">✅ Bot Connected!</h2>' +  
+          '<p style="color:#aaa;margin:0;">Open /dashboard</p>' +  
+          '</body></html>');  
+        return;  
+      }  
+  
+      if (!currentQR) {  
+        res.end('<!doctype html><html><body style="font-family:Segoe UI,Arial,sans-serif;background:#111;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;text-align:center;">' +  
+          '<h2 style="color:#f39c12;margin:0 0 10px;">⏳ QR not ready</h2>' +  
+          '<p style="color:#aaa;margin:0;">Status: ' + botStatus + '</p>' +  
+          '</body></html>');  
+        return;  
+      }  
+  
+      try {  
+        const qrDataURL = await QRCode.toDataURL(currentQR, { width: 300, margin: 2 });  
+        res.end(  
+          '<!doctype html><html><head><meta http-equiv="refresh" content="25"/></head><body style="font-family:Segoe UI,Arial,sans-serif;background:#111;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;text-align:center;padding:20px;">' +  
+          '<h2 style="color:#25D366;margin:0 0 10px;">📱 WhatsApp QR</h2>' +  
+          '<img src="' + qrDataURL + '" style="border:8px solid white;border-radius:12px;width:280px;height:280px;"/>' +  
+          '<p style="color:#f39c12;margin-top:15px;">⚠️ QR expires in ~25 sec</p>' +  
+          '<p style="color:#aaa;margin-top:6px;">Scan to connect bot.</p>' +  
+          '</body></html>'  
+        );  
+      } catch (e) {  
+        res.end('<h1 style="color:red;font-family:Segoe UI,Arial,sans-serif;">QR Error: ' + (e?.message || e) + '</h1>');  
+      }  
+      return;  
+    }  
+  
+    // Auth check for everything else  
+    if (pathname !== '/qr' && pathname !== '/login' && pathname !== '/health' && !isAuthenticated(req)) {  
+      res.writeHead(302, { Location: '/login' });  
+      res.end();  
+      return;  
+    }  
+  
+    // Dashboard  
+    if (pathname === '/dashboard' || pathname === '/') {  
+      res.writeHead(200, { 'Content-Type': 'text/html' });  
+      res.end(dashboardHtml());  
+      return;  
+    }  
+  
+    // API: get data  
+    if (pathname === '/api/data' && method === 'GET') {  
+      res.writeHead(200, { 'Content-Type': 'application/json' });  
+  
+      const ordersArr = Object.values(botData.orders || {});  
+      const MAX_ORDERS = parseInt(process.env.MAX_ORDERS_TO_RETURN || '80', 10);  
+  
+      ordersArr.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));  
+      const orders = ordersArr.slice(0, MAX_ORDERS).map((o) => {  
+        const product = (botData.products || []).find((p) => p.id === o.productId) || (botData.products || [])[0];  
+        return {  
+          orderId: o.orderId,  
+          customerJid: o.customerJid,  
+          customerNumber: o.customerNumber,  
+          customerName: o.customerName,  
+          productId: o.productId,  
+          productName: product?.name || '',  
+          language: o.language,  
+          status: o.status,  
+          hasScreenshot: !!o.hasScreenshot,  
+          timestamp: o.timestamp  
+        };  
+      });  
+  
+      const pending = ordersArr.filter((o) => o.status === 'pending').length;  
+      const approved = ordersArr.filter((o) => o.status === 'approved').length;  
+      const rejected = ordersArr.filter((o) => o.status === 'rejected').length;  
+  
+      let revenue = 0;  
+      for (const o of ordersArr) {  
+        if (o.status !== 'approved') continue;  
+        const p = (botData.products || []).find((x) => x.id === o.productId);  
+        revenue += p?.price || 0;  
+      }  
+  
+      res.end(  
+        JSON.stringify({  
+          botStatus,  
+          settings: botData.settings,  
+          payment: botData.payment,  
+          products: botData.products,  
+          aiPrompt: botData.aiPrompt,  
+          orders,  
+          stats: {  
+            pending,  
+            approved,  
+            rejected,  
+            total: ordersArr.length,  
+            revenue  
+          }  
+        })  
+      );  
+      return;  
+    }  
+  
+    // API: update prompt  
+    if (pathname === '/api/prompt' && method === 'POST') {  
+      const body = await parseBody(req);  
+      botData.aiPrompt = typeof body.prompt === 'string' ? body.prompt : botData.aiPrompt;  
+      requestSaveData(0);  
+      res.writeHead(200, { 'Content-Type': 'application/json' });  
+      res.end(JSON.stringify({ success: true }));  
+      return;  
+    }  
+  
+    // API: update settings  
+    if (pathname === '/api/settings' && method === 'POST') {  
+      const b = await parseBody(req);  
+  
+      if (typeof b.businessName === 'string') botData.settings.businessName = b.businessName;  
+      if (typeof b.adminNumber === 'string') botData.settings.adminNumber = b.adminNumber;  
+      if (typeof b.dashboardPassword === 'string' && b.dashboardPassword.trim()) {  
+        botData.settings.dashboardPassword = b.dashboardPassword.trim();  
+      }  
+  
+      requestSaveData(0);  
+      res.writeHead(200, { 'Content-Type': 'application/json' });  
+      res.end(JSON.stringify({ success: true }));  
+      return;  
+    }  
+  
+    // API: update payment  
+    if (pathname === '/api/payment' && method === 'POST') {  
+      const b = await parseBody(req);  
+  
+      if (b?.easypaisa?.number) botData.payment.easypaisa.number = b.easypaisa.number;  
+      if (b?.easypaisa?.name) botData.payment.easypaisa.name = b.easypaisa.name;  
+  
+      if (b?.jazzcash?.number) botData.payment.jazzcash.number = b.jazzcash.number;  
+      if (b?.jazzcash?.name) botData.payment.jazzcash.name = b.jazzcash.name;  
+  
+      if (b?.bank?.bankName) botData.payment.bank.bankName = b.bank.bankName;  
+      if (b?.bank?.accountNumber) botData.payment.bank.accountNumber = b.bank.accountNumber;  
+      if (b?.bank?.accountName) botData.payment.bank.accountName = b.bank.accountName;  
+      if (b?.bank?.iban) botData.payment.bank.iban = b.bank.iban;  
+  
+      requestSaveData(0);  
+      res.writeHead(200, { 'Content-Type': 'application/json' });  
+      res.end(JSON.stringify({ success: true }));  
+      return;  
+    }  
+  
+    // API: update products  
+    if (pathname === '/api/products' && method === 'POST') {  
+      const products = await parseBody(req);  
+      if (!Array.isArray(products)) {  
+        res.writeHead(400, { 'Content-Type': 'application/json' });  
+        res.end(JSON.stringify({ success: false, error: 'products must be array' }));  
+        return;  
+      }  
+      // minimal normalization  
+      botData.products = products.map((p, idx) => ({  
+        id: p.id ?? idx + 1,  
+        name: p.name || `Product ${idx + 1}`,  
+        price: Number(p.price || 0),  
+        description: p.description || '',  
+        features: Array.isArray(p.features) ? p.features : [],  
+        downloadLink: p.downloadLink || '',  
+        active: !!p.active  
+      }));  
+      if (!botData.products.some((p) => p.active)) {  
+        botData.products[0].active = true;  
+      }  
+  
+      requestSaveData(0);  
+      res.writeHead(200, { 'Content-Type': 'application/json' });  
+      res.end(JSON.stringify({ success: true }));  
+      return;  
+    }  
+  
+    // API: approve/reject  
+    if (pathname.startsWith('/api/approve/') && method === 'POST') {  
+      const orderId = parseInt(pathname.split('/api/approve/')[1], 10);  
+      const order = Object.values(botData.orders || {}).find((o) => o.orderId === orderId);  
+  
+      if (order && sockGlobal) {  
+        order.status = 'approved';  
+        requestSaveData(0);  
+  
+        const product =  
+          (botData.products || []).find((p) => p.id === order.productId) || (botData.products || [])[0];  
+  
+        try {  
+          const msg = await paymentApprovedAI(order, product, order.customerName || 'Customer');  
+          await sockGlobal.sendMessage(order.customerJid, { text: msg });  
+        } catch (e) {  
+          await sockGlobal.sendMessage(order.customerJid, { text: getPaymentApprovedStatic(order, product, order.language || 'roman_urdu') }).catch(() => {});  
+        }  
+  
+        saveToSheet({  
+          orderId: order.orderId,  
+          customerName: order.customerName,  
+          customerNumber: order.customerNumber,  
+          product: product?.name || '',  
+          amount: product?.price || '',  
+          status: 'approved',  
+          language: order.language  
+        }).catch(() => {});  
+      }  
+  
+      res.writeHead(200, { 'Content-Type': 'application/json' });  
+      res.end(JSON.stringify({ success: true }));  
+      return;  
+    }  
+  
+    if (pathname.startsWith('/api/reject/') && method === 'POST') {  
+      const orderId = parseInt(pathname.split('/api/reject/')[1], 10);  
+      const order = Object.values(botData.orders || {}).find((o) => o.orderId === orderId);  
+  
+      if (order && sockGlobal) {  
+        order.status = 'rejected';  
+        requestSaveData(0);  
+  
+        try {  
+          const msg = await paymentRejectedAI(order, order.customerName || 'Customer');  
+          await sockGlobal.sendMessage(order.customerJid, { text: msg });  
+        } catch {  
+          await sockGlobal.sendMessage(order.customerJid, { text: getPaymentRejectedStatic(order, order.language || 'roman_urdu') }).catch(() => {});  
+        }  
+  
+        saveToSheet({  
+          orderId: order.orderId,  
+          customerName: order.customerName,  
+          customerNumber: order.customerNumber,  
+          product: (botData.products || []).find((p) => p.id === order.productId)?.name || '',  
+          amount: (botData.products || []).find((p) => p.id === order.productId)?.price || '',  
+          status: 'rejected',  
+          language: order.language  
+        }).catch(() => {});  
+      }  
+  
+      res.writeHead(200, { 'Content-Type': 'application/json' });  
+      res.end(JSON.stringify({ success: true }));  
+      return;  
+    }  
+  
+    // Logout  
+    if (pathname === '/logout') {  
+      res.writeHead(302, {  
+        'Set-Cookie': 'session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT',  
+        Location: '/login'  
+      });  
+      res.end();  
+      return;  
+    }  
+  
+    res.writeHead(404, { 'Content-Type': 'application/json' });  
+    res.end(JSON.stringify({ error: 'Not found' }));  
+  } catch (e) {  
+    console.error('Server handler error:', e?.message || e);  
+    res.writeHead(500, { 'Content-Type': 'application/json' });  
+    res.end(JSON.stringify({ error: 'Internal server error' }));  
+  }  
 });  
   
-// ─────────────────────────────────────────// MAIN // ─────────────────────────────────────────  
-(async () => {  
-  await loadData();  
-  console.log('🚀 Mega Agency AI Sales Bot v2 (Upstash WA Auth + AI Replies) STARTING...');  
-  server.listen(process.env.PORT || 3000, () => {  
-    console.log(' Server ready! /dashboard | /qr');  
-  });  
-  startBot();  
-})();
+/* ─────────────────────────────  
+   BOOT  
+───────────────────────────── */  
+server.listen(PORT, () => {  
+  console.log(`🚀 Server ready on port ${PORT}`);  
+  console.log('   Open /login then /dashboard. Open /qr for WhatsApp QR.');  
+});  
+  
+// Start server ASAP, then load data and start bot in background (prevents Render 502 at boot)  
+loadData()  
+  .then(() => console.log('✅ botData loaded'))  
+  .catch(() => {});  
+startBot().catch(() => {});  
